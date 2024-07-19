@@ -95,9 +95,10 @@ void AudioEngineInterruptionListenerCallback(void *user_data, UInt32 interruptio
             AudioSessionInitialize(NULL, NULL, AudioEngineInterruptionListenerCallback, self);
         }
 
-        BOOL success = [[AVAudioSession sharedInstance]
-            setCategory:AVAudioSessionCategoryPlayback
-                  error:nil];
+        // BOOL success = [[AVAudioSession sharedInstance]
+        //     setCategory:AVAudioSessionCategoryPlayback
+        //           error:nil];
+        BOOL success = [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryAmbient error:nil];
         if (!success)
             ALOGE("Fail to set audio session.");
     }
@@ -131,6 +132,8 @@ void AudioEngineInterruptionListenerCallback(void *user_data, UInt32 interruptio
             if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
                 ALOGD("AVAudioSessionInterruptionTypeEnded, application != UIApplicationStateActive, resumeOnBecomingActive = true");
                 resumeOnBecomingActive = true;
+            }else {
+                pauseOnResignActive = false;
             }
         }
     } else if ([notification.name isEqualToString:UIApplicationWillResignActiveNotification]) {
