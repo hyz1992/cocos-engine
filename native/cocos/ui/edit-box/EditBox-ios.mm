@@ -267,6 +267,8 @@ void onParentViewTouched(const cc::CustomEvent &touchEvent){
 }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    const ccstd::string text([[[EditboxManager sharedInstance]getCurrentText] UTF8String]);
+    callJSFunc("confirm", text);
     cc::EditBox::complete();
     return YES;
 }

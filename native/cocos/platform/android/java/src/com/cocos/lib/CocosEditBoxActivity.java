@@ -217,7 +217,11 @@ public class CocosEditBoxActivity extends Activity {
                 @Override
                 public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
                     if (! mIsMultiLine) {
-                        CocosEditBoxActivity.this.hide();
+                        if(actionId==(actionId&Cocos2dxEditText.this.getImeOptions())){
+                            CocosEditBoxActivity.this.onKeyboardConfirm(mEditText.getText().toString());
+                        }else{
+                            CocosEditBoxActivity.this.hide();
+                        }
                     }
 
                     return false; // pass on to other listeners.
