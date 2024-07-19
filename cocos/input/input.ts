@@ -292,9 +292,12 @@ export class Input {
                 if (!dispatcher.dispatchEvent(event)) {
                     break;
                 }
-            } catch (e) {
-                console.error(`Error occurs in an event listener: ${event.type}`);
-                console.error(e);
+            // } catch (e) {
+            //     console.error(`Error occurs in an event listener: ${event.type}`);
+            //     console.error(e);
+            } catch(e) {
+                this._clearEvents()
+                throw e
             }
         }
     }
