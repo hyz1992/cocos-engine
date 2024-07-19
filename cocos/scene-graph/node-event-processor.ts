@@ -292,11 +292,15 @@ export class NodeEventProcessor {
         // checks if destroyed in capturing callbacks
         event.eventPhase = 2;
         event.currentTarget = owner;
-        if (this.capturingTarget) {
-            this.capturingTarget.emit(event.type, event);
-        }
-        if (!event.propagationImmediateStopped && this.bubblingTarget) {
-            this.bubblingTarget.emit(event.type, event);
+        try {
+            if (this.capturingTarget) {
+                this.capturingTarget.emit(event.type, event);
+            }
+            if (!event.propagationImmediateStopped && this.bubblingTarget) {
+                this.bubblingTarget.emit(event.type, event);
+            }
+        } catch (e) {
+            throw e
         }
 
         if (!event.propagationStopped && event.bubbles) {

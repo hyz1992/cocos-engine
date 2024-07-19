@@ -142,8 +142,14 @@ class PointerEventDispatcher implements IEventDispatcher {
                 } else if (pointerEventProcessor.claimedTouchIdList.length > 0) {
                     const index = pointerEventProcessor.claimedTouchIdList.indexOf(touch.getID());
                     if (index !== -1) {
-                        // @ts-expect-error access private method
-                        pointerEventProcessor._handleEventTouch(eventTouch);
+                        try {
+                            // @ts-expect-error access private method
+                            pointerEventProcessor._handleEventTouch(eventTouch);
+                        } catch (err) {
+                            this._inDispatchCount = 0;
+                            this._updatePointerEventProcessorList();
+                            throw err
+                        }
                         if (eventTouch.type === InputEventType.TOUCH_END || eventTouch.type === InputEventType.TOUCH_CANCEL) {
                             js.array.removeAt(pointerEventProcessor.claimedTouchIdList, index);
                         }
