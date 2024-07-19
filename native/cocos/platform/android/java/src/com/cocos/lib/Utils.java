@@ -46,7 +46,7 @@ public class Utils {
                     | SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                     | SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                     | SYSTEM_UI_FLAG_HIDE_NAVIGATION // hide nav bar
-                    | SYSTEM_UI_FLAG_FULLSCREEN // hide status bar
+                    // | SYSTEM_UI_FLAG_FULLSCREEN // hide status bar
                     | SYSTEM_UI_FLAG_IMMERSIVE_STICKY};
             CocosReflectionHelper.<Void>invokeInstanceMethod(GlobalObject.getActivity().getWindow().getDecorView(),
                     "setSystemUiVisibility",
