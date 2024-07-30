@@ -132,7 +132,7 @@ namespace ccstd
         };
 #else
         template <typename T>
-        struct hash_base : std::unary_function<T, hash_t> {};
+    struct hash_base : std::__unary_function<T, hash_t> {};
 #endif
 
         struct enable_hash_value { typedef hash_t type; };
