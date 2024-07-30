@@ -139,9 +139,9 @@ public class CocosTouchHandler {
                 break;
         }
 
-        if (BuildConfig.DEBUG) {
+//        if (BuildConfig.DEBUG) {
 //            CocosTouchHandler.dumpMotionEvent(pMotionEvent);
-        }
+//        }
         return true;
     }
 
