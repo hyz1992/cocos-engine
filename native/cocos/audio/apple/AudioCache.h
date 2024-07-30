@@ -33,6 +33,7 @@
 #include "audio/apple/AudioMacros.h"
 #include "base/Macros.h"
 #include "base/std/container/vector.h"
+#include <functional>
 
 #define INVALID_AL_BUFFER_ID 0xFFFFFFFF
 
