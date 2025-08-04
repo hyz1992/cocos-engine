@@ -1,9 +1,8 @@
 apply plugin: 'com.android.library'
 
 android {
-    ndkPath PROP_NDK_PATH
     compileSdkVersion PROP_COMPILE_SDK_VERSION.toInteger()
-    ndkPath PROP_NDK_PATH
+    ndkVersion PROP_NDK_VERSION
     namespace "com.cocos.lib"
     defaultConfig {
         minSdkVersion PROP_MIN_SDK_VERSION
