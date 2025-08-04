@@ -275,7 +275,7 @@ export class NodeEventProcessor {
         event.eventPhase = 1;
         for (i = _cachedArray.length - 1; i >= 0; --i) {
             target = _cachedArray[i];
-            if (target.eventProcessor.capturingTarget) {
+            if (target&&target.eventProcessor.capturingTarget) {
                 event.currentTarget = target;
                 // fire event
                 target.eventProcessor.capturingTarget.emit(event.type, event, _cachedArray);
@@ -310,7 +310,7 @@ export class NodeEventProcessor {
             event.eventPhase = 3;
             for (i = 0; i < _cachedArray.length; ++i) {
                 target = _cachedArray[i];
-                if (target.eventProcessor.bubblingTarget) {
+                if (target&&target.eventProcessor.bubblingTarget) {
                     event.currentTarget = target;
                     // fire event
                     target.eventProcessor.bubblingTarget.emit(event.type, event);
