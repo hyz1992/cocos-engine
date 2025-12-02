@@ -24,8 +24,13 @@
 
 #include "2d/renderer/Batcher2d.h"
 #include "application/ApplicationManager.h"
+#include "base/Log.h"
 #include "base/TypeDef.h"
+#include "base/std/container/map.h"
+#include "base/std/container/vector.h"
 #include "core/Root.h"
+#include "core/assets/ImageAsset.h"
+#include "core/assets/Texture2D.h"
 #include "core/scene-graph/Scene.h"
 #include "editor-support/MiddlewareManager.h"
 #include "renderer/pipeline/Define.h"
@@ -40,16 +45,16 @@ int32_t sorting2DCount{0};
 
 CC_FORCE_INLINE void fillIndexBuffers(RenderDrawInfo* drawInfo) { // NOLINT(readability-convert-member-functions-to-static)
     uint16_t* ib = drawInfo->getIDataBuffer();
-    
+
     UIMeshBuffer* buffer = drawInfo->getMeshBuffer();
     uint32_t indexOffset = buffer->getIndexOffset();
-    
+
     uint16_t* indexb = drawInfo->getIbBuffer();
     uint32_t indexCount = drawInfo->getIbCount();
-    
+
     memcpy(&ib[indexOffset], indexb, indexCount * sizeof(uint16_t));
     indexOffset += indexCount;
-    
+
     buffer->setIndexOffset(indexOffset);
 }
 
@@ -83,7 +88,7 @@ CC_FORCE_INLINE void fillColor(RenderEntity* entity, RenderDrawInfo* drawInfo) {
     uint32_t size = drawInfo->getVbCount() * stride;
     float* vbBuffer = drawInfo->getVbBuffer();
     Color temp = entity->getColor();
-    
+
     uint32_t offset = 0;
     for (int i = 0; i < size; i += stride) {
         offset = i + 5;
@@ -91,13 +96,81 @@ CC_FORCE_INLINE void fillColor(RenderEntity* entity, RenderDrawInfo* drawInfo) {
         // Spine set 'UIRenderer._useVertexOpacity = true', it uses RGBA32 (4 bytes) color and fills color in Skeleton._updateColor and spine/simple.ts assembler.
         // So for Spine rendering, it will never go here to fill color.
         vbBuffer[offset] = static_cast<float>(temp.r) / 255.0F;
-        vbBuffer[offset+1] = static_cast<float>(temp.g) / 255.0F;
-        vbBuffer[offset+2] = static_cast<float>(temp.b) / 255.0F;
-        vbBuffer[offset+3] = entity->getOpacity();
+        vbBuffer[offset + 1] = static_cast<float>(temp.g) / 255.0F;
+        vbBuffer[offset + 2] = static_cast<float>(temp.b) / 255.0F;
+        vbBuffer[offset + 3] = entity->getOpacity();
     }
 }
 
 } // namespace
+
+uint32_t g_count = 0;
+uint32_t g_cache = 0;
+bool g_isMult = false;
+Material* g_currMaterial{nullptr};
+Texture2D* g_texture{nullptr};
+ccstd::vector<Material*> g_materials;
+ccstd::map<void*, uint32_t> g_textures;
+
+Texture2D* getDefultTexture() {
+    if (g_texture != nullptr) return g_texture;
+
+    auto _arrayBuffer = ccnew ArrayBuffer(32);
+    auto _valueView = Float32Array(_arrayBuffer);
+    _valueView[0] = _valueView[1] = _valueView[2] = _valueView[3] = 0;
+
+    auto* imageAsset = ccnew ImageAsset();
+    IMemoryImageSource source{_arrayBuffer, false, 1, 1, PixelFormat::RGBA8888};
+    imageAsset->setNativeAsset(source);
+
+    g_texture = ccnew Texture2D();
+    g_texture->setFilters(Texture2D::Filter::NEAREST, Texture2D::Filter::NEAREST);
+    g_texture->setMipFilter(Texture2D::Filter::NONE);
+    g_texture->setWrapMode(Texture2D::WrapMode::CLAMP_TO_EDGE, Texture2D::WrapMode::CLAMP_TO_EDGE, Texture2D::WrapMode::CLAMP_TO_EDGE);
+    g_texture->setImage(imageAsset);
+    g_texture->initialize();
+    g_texture->addAssetRef();
+
+    return g_texture;
+}
+
+void filltexture() {
+    if (g_currMaterial) {
+        auto t = getDefultTexture();
+        for (int i = g_count; i < 8; i++) {
+            ccstd::string name = "texture" + std::to_string(i);
+            const auto& pass = g_currMaterial->getPasses()->at(0);
+            uint32_t handle = pass->getHandle(name);
+
+            uint32_t binding = scene::Pass::getBindingFromHandle(handle);
+            pass->bindTexture(binding, t->getGFXTexture(), 0);
+            pass->bindSampler(binding, t->getGFXSampler(), 0);
+        }
+    }
+}
+void g_mult_next() {
+    g_textures.clear();
+    filltexture();
+
+    g_currMaterial = nullptr;
+    g_isMult = false;
+    g_count = 0;
+}
+
+void g_mult_reset() {
+    g_mult_next();
+    g_cache = 0;
+}
+
+void g_mult_clear(){
+    g_mult_reset();
+    for(int i = 0; i < g_materials.size();i++) {
+        CC_SAFE_DELETE(g_materials[i]);
+    }
+    g_materials.clear();
+    CC_SAFE_DELETE(g_texture);
+    g_texture = nullptr;
+}
 
 Batcher2d::Batcher2d() : Batcher2d(nullptr) {
 }
@@ -110,11 +183,18 @@ Batcher2d::Batcher2d(Root* root)
     _root = root;
     _device = _root->getDevice();
     _stencilManager = StencilManager::getInstance();
-    
+
     _recordedRendererInfoQueue.reserve(100);
+
+    getDefultTexture();
+    CC_LOG_WARNING("Batcher2d::Batcher2d");
 }
 
 Batcher2d::~Batcher2d() { // NOLINT
+
+    g_mult_clear();
+    CC_LOG_WARNING("Batcher2d::~Batcher2d");
+
     _drawBatchPool.destroy();
 
     for (auto iter : _descriptorSetCache) {
@@ -138,7 +218,7 @@ Batcher2d::~Batcher2d() { // NOLINT
     _maskAttributes.clear();
 }
 
-ccstd::vector<RecordedRendererInfo> &Batcher2d::getRecordedRendererInfoQueue() {
+ccstd::vector<RecordedRendererInfo>& Batcher2d::getRecordedRendererInfoQueue() {
     return _recordedRendererInfoQueue;
 }
 
@@ -170,11 +250,11 @@ void Batcher2d::fillBuffersAndMergeBatches() {
     for (auto* rootNode : _rootNodeArr) {
         // _batches will add by generateBatch
         walk(rootNode, 1, false);
-        
+
         if (ENABLE_SORTING_2D && sorting2DCount > 0) {
             flushRecordedUIRenderers();
         }
-        
+
         generateBatch(_currEntity, _currDrawInfo);
 
         auto* scene = rootNode->getScene()->getRenderScene();
@@ -186,7 +266,7 @@ void Batcher2d::fillBuffersAndMergeBatches() {
     }
 }
 
-void Batcher2d::handleUIRenderer(RenderEntity *entity) { // NOLINT(misc-no-recursion)
+void Batcher2d::handleUIRenderer(RenderEntity* entity) { // NOLINT(misc-no-recursion)
     uint32_t size = entity->getRenderDrawInfosSize();
     for (uint32_t i = 0; i < size; i++) {
         auto* drawInfo = entity->getRenderDrawInfoAt(i);
@@ -195,25 +275,25 @@ void Batcher2d::handleUIRenderer(RenderEntity *entity) { // NOLINT(misc-no-recur
     entity->setVBColorDirty(false);
 }
 
-int32_t Batcher2d::recordUIRenderer(RenderEntity *entity) {
+int32_t Batcher2d::recordUIRenderer(RenderEntity* entity) {
     if (!ENABLE_SORTING_2D) return -1;
-    auto &queue = getRecordedRendererInfoQueue();
-    auto &info = queue.emplace_back();
+    auto& queue = getRecordedRendererInfoQueue();
+    auto& info = queue.emplace_back();
     info.renderEntity = entity;
     return static_cast<int32_t>(queue.size() - 1);
 }
 
 void Batcher2d::flushRecordedUIRenderers() { // NOLINT(misc-no-recursion)
     if (!ENABLE_SORTING_2D) return;
-    auto &queue = getRecordedRendererInfoQueue();
+    auto& queue = getRecordedRendererInfoQueue();
     if (queue.empty()) return;
 
-    std::stable_sort(queue.begin(), queue.end(), [](const auto &a, const auto &b){
+    std::stable_sort(queue.begin(), queue.end(), [](const auto& a, const auto& b) {
         return a.renderEntity->getPriority() < b.renderEntity->getPriority();
     });
 
-    for (const auto &info : queue) {
-        auto *entity = info.renderEntity;
+    for (const auto& info : queue) {
+        auto* entity = info.renderEntity;
         if (entity) {
             handleUIRenderer(entity);
         }
@@ -227,13 +307,13 @@ void Batcher2d::walk(Node* node, float parentOpacity, bool parentColorDirty) { /
     }
     bool breakWalk = false;
     auto* entity = static_cast<RenderEntity*>(node->getUserData());
-    
+
     const bool isCurrentColorDirty = node->_isColorDirty() || parentColorDirty;
     const float localOpacity = node->_getLocalOpacity();
     // Keep the same logic as which in batcher-2d.ts
     const float finalOpacity = parentOpacity * localOpacity * (entity ? entity->getColorAlpha() : 1.F);
     node->_setFinalOpacity(finalOpacity);
-    
+
     const bool visible = math::isNotEqualF(finalOpacity, 0);
 
     if (entity) {
@@ -244,7 +324,7 @@ void Batcher2d::walk(Node* node, float parentOpacity, bool parentColorDirty) { /
                 entity->setOpacity(finalOpacity);
                 entity->setVBColorDirty(true);
             }
-            
+
             if (ENABLE_SORTING_2D && sorting2DCount > 0) {
                 if (entity->getIsMask()) {
                     flushRecordedUIRenderers();
@@ -257,7 +337,7 @@ void Batcher2d::walk(Node* node, float parentOpacity, bool parentColorDirty) { /
                 handleUIRenderer(entity);
             }
         }
-        
+
         if (entity->getRenderEntityType() == RenderEntityType::CROSSED) {
             breakWalk = true;
         }
@@ -271,7 +351,7 @@ void Batcher2d::walk(Node* node, float parentOpacity, bool parentColorDirty) { /
             walk(child, thisOpacity, isCurrentColorDirty);
         }
     }
-    
+
     if (isCurrentColorDirty) {
         node->_setColorDirty(false);
     }
@@ -283,7 +363,7 @@ void Batcher2d::walk(Node* node, float parentOpacity, bool parentColorDirty) { /
                 flushRecordedUIRenderers();
             }
         }
-        
+
         if (visible && _stencilManager->getMaskStackSize() > 0) {
             handlePostRender(entity);
         }
@@ -315,7 +395,26 @@ CC_FORCE_INLINE void Batcher2d::handleComponentDraw(RenderEntity* entity, Render
     }
     auto tempStage = static_cast<StencilStage>(entity->getStencilStage());
 
-    if (_currHash != dataHash || dataHash == 0 || _currMaterial != drawInfo->getMaterial() || _currStencilStage != tempStage) {
+    int texid = -1;
+    bool isMult = false;
+    bool isFlush = false;
+    auto tex = drawInfo->getTexture();
+    auto mat = drawInfo->getMaterial();
+
+    if (tex && mat && mat->getEffectName().find("Mult-effect") != std::string::npos) {
+        isMult = true;
+        auto iter = g_textures.find(tex);
+        if (iter == g_textures.end()) {
+            if (g_count >= 8) isFlush = true;
+        } else {
+            texid = iter->second;
+        }
+
+        if (g_isMult) mat = _currMaterial;
+    }
+
+    if (isFlush || _currHash != dataHash || dataHash == 0 || _currMaterial != mat || _currStencilStage != tempStage) {
+        // if (_currHash != dataHash || dataHash == 0 || _currMaterial != drawInfo->getMaterial() || _currStencilStage != tempStage) {
         // Generate a batch if not batching
         generateBatch(_currEntity, _currDrawInfo);
 
@@ -326,8 +425,27 @@ CC_FORCE_INLINE void Batcher2d::handleComponentDraw(RenderEntity* entity, Render
                 _indexStart = _currMeshBuffer->getIndexOffset();
             }
         }
+
+        g_isMult = isMult;
+        if (isMult) {
+            if (g_cache < g_materials.size()) {
+                _currMaterial = g_materials[g_cache];
+            } else {
+                // auto m = drawInfo->getMaterial();
+                _currMaterial = ccnew Material();
+                g_materials.push_back(_currMaterial);
+                _currMaterial->copy(drawInfo->getMaterial());
+
+                //CC_LOG_WARNING("new mult cache : %d , %d", g_cache, g_materials.size());
+            }
+            g_cache++;
+
+            g_currMaterial = _currMaterial;
+
+        } else
+            _currMaterial = drawInfo->getMaterial();
+
         _currHash = dataHash;
-        _currMaterial = drawInfo->getMaterial();
         _currStencilStage = tempStage;
         _currLayer = entity->getNode()->getLayer();
         _currEntity = entity;
@@ -366,6 +484,34 @@ CC_FORCE_INLINE void Batcher2d::handleComponentDraw(RenderEntity* entity, Render
         }
 
         fillIndexBuffers(drawInfo);
+
+        if (isMult) {
+            if (texid < 0 || g_count == 0) {
+                texid = g_count++;
+                g_textures[tex] = texid;
+                ccstd::string name = "texture" + std::to_string(texid);
+                const auto& pass = _currMaterial->getPasses()->at(0);
+                uint32_t handle = pass->getHandle(name);
+
+                // _currMaterial->setProperty(name,drawInfo->getTexture(),0);
+                uint32_t binding = scene::Pass::getBindingFromHandle(handle);
+                pass->bindTexture(binding, drawInfo->getTexture(), 0);
+                pass->bindSampler(binding, drawInfo->getSampler(), 0);
+            }
+
+            Color temp = entity->getColor();
+            // float opacity = entity->getOpacity();
+            uint8_t stride = drawInfo->getStride();
+            float* vbBuffer = drawInfo->getVbBuffer();
+            uint32_t size = drawInfo->getVbCount() * stride;
+
+            // uint32_t offset = 0;
+            auto newid = floor((static_cast<float>(temp.r) / 255.0F) * 100000) * 10 + texid;
+            for (int i = 0; i < size; i += stride) {
+                // offset = i + 5;
+                vbBuffer[i + 5] = newid;
+            }
+        }
     }
 
     if (isMask) {
@@ -472,6 +618,8 @@ CC_FORCE_INLINE void Batcher2d::handleDrawInfo(RenderEntity* entity, RenderDrawI
 }
 
 void Batcher2d::generateBatch(RenderEntity* entity, RenderDrawInfo* drawInfo) {
+    g_mult_next();
+
     if (drawInfo == nullptr) {
         return;
     }
@@ -521,7 +669,7 @@ void Batcher2d::generateBatch(RenderEntity* entity, RenderDrawInfo* drawInfo) {
     curdrawBatch->setFirstIndex(indexOffset);
     curdrawBatch->setIndexCount(indexCount);
     curdrawBatch->fillPass(_currMaterial, depthStencil, dssHash);
-    const auto &passes = curdrawBatch->getPasses();
+    const auto& passes = curdrawBatch->getPasses();
     if (!passes.empty()) {
         const auto& pass = passes.at(0);
         if (entity->getUseLocal()) {
@@ -585,6 +733,7 @@ void Batcher2d::resetRenderStates() {
     _currEntity = nullptr;
     _currMiddlewareIbCount = 0;
     _currDrawInfo = nullptr;
+    g_mult_next();
 }
 
 gfx::DescriptorSet* Batcher2d::getDescriptorSet(gfx::Texture* texture, gfx::Sampler* sampler, const gfx::DescriptorSetLayout* dsLayout) {
@@ -644,6 +793,7 @@ bool Batcher2d::initialize() {
 void Batcher2d::update() {
     fillBuffersAndMergeBatches();
     resetRenderStates();
+    g_mult_reset();
 }
 
 void Batcher2d::uploadBuffers() {
