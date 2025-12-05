@@ -72,6 +72,8 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
 - (void)handleInterruption:(NSNotification *)notification;
 - (void)resumeAudio:(NSNotification *)notification;
 - (void)reactiveAudio;
+- (void)handleVoiceRecordWillStart:(NSNotification *)notification;
+- (void)handleVoiceRecordDidFinish:(NSNotification *)notification;
 
 @end
 
@@ -84,11 +86,19 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(resumeAudio:) name:UIApplicationDidBecomeActiveNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(resumeAudio:) name:UIApplicationWillEnterForegroundNotification object:nil];
         
+        // 监听录音模块的通知
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleVoiceRecordWillStart:) name:@"VoiceRecordWillStartRecording" object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleVoiceRecordDidFinish:) name:@"VoiceRecordDidFinishRecording" object:nil];
+        
+        NSError *error = nil;
         BOOL success = [[AVAudioSession sharedInstance]
                         setCategory:AVAudioSessionCategoryAmbient
-                        error:nil];
-        if (!success)
-            ALOGE("Fail to set audio session.");
+                        error:&error];
+        if (!success) {
+            ALOGE("[AUDIO_DEBUG] AudioEngine: Fail to set audio session in init, error=%s", error ? error.description.UTF8String : "nil");
+        } else {
+            ALOGI("[AUDIO_DEBUG] AudioEngine: Audio session initialized with category Ambient");
+        }
     }
     return self;
 }
@@ -96,15 +106,32 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
 - (void)reactiveAudio {
     if (self.needReactiveContext) {
         self.needReactiveContext = false;
+        ALOGI("[AUDIO_DEBUG] AudioEngine: reactiveAudio - attempting to restore audio context");
+        
+        AVAudioSession *audioSession = [AVAudioSession sharedInstance];
         NSError *error = nil;
-        BOOL success = [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryAmbient error:&error];
+        
+        ALOGI("[AUDIO_DEBUG] AudioEngine: Current audio session category=%s, isOtherAudioPlaying=%d", 
+              audioSession.category.UTF8String, audioSession.isOtherAudioPlaying);
+        
+        BOOL success = [audioSession setCategory:AVAudioSessionCategoryAmbient error:&error];
         if (!success) {
-            ALOGE("Fail to set audio session.");
+            ALOGE("[AUDIO_DEBUG] AudioEngine: Fail to set audio session, error=%s", error ? error.description.UTF8String : "nil");
             return;
         }
-        [[AVAudioSession sharedInstance] setActive:YES error:&error];
+        ALOGI("[AUDIO_DEBUG] AudioEngine: setCategory SUCCESS");
+        
+        [audioSession setActive:YES error:&error];
+        if (error) {
+            ALOGE("[AUDIO_DEBUG] AudioEngine: setActive FAILED, error=%s", error.description.UTF8String);
+        } else {
+            ALOGI("[AUDIO_DEBUG] AudioEngine: setActive SUCCESS");
+        }
+        
         if (!alcMakeContextCurrent(s_ALContext)) {
-            ALOGE("audio context is invalid, need to recreate!");
+            ALOGE("[AUDIO_DEBUG] AudioEngine: alcMakeContextCurrent FAILED - audio context is invalid, need to recreate!");
+        } else {
+            ALOGI("[AUDIO_DEBUG] AudioEngine: alcMakeContextCurrent SUCCESS - OpenAL context restored");
         }
     }
 }
@@ -118,8 +145,10 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
     if ([notification.name isEqualToString:AVAudioSessionInterruptionNotification]) {
         NSInteger reason = [[[notification userInfo] objectForKey:AVAudioSessionInterruptionTypeKey] integerValue];
         if (reason == AVAudioSessionInterruptionTypeBegan) {
+            ALOGI("[AUDIO_DEBUG] AudioEngine: Audio interruption BEGAN - suspending OpenAL context");
             alcMakeContextCurrent(nullptr);
         } else if (reason == AVAudioSessionInterruptionTypeEnded) {
+            ALOGI("[AUDIO_DEBUG] AudioEngine: Audio interruption ENDED - scheduling context restoration");
             // When the application goes to background, invoke alcMakeContextCurrent may fail. So a flag is set here to delay the execution
             self.needReactiveContext = true;
             if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
@@ -129,10 +158,72 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
     }
 }
 
+- (void)handleVoiceRecordWillStart:(NSNotification *)notification {
+    ALOGI("[AUDIO_DEBUG] AudioEngine: VoiceRecord will start - game audio will be ducked (auto reduced to ~20%% volume)");
+    // 录音即将开始
+    // 使用了 PlayAndRecord + DuckOthers 方案：
+    // - 游戏音效不会中断，只是音量自动降低到约 20%
+    // - 录音结束后音量会自动恢复到 100%
+    // - 不需要手动干预，系统自动处理
+}
+
+- (void)handleVoiceRecordDidFinish:(NSNotification *)notification {
+    ALOGI("[AUDIO_DEBUG] AudioEngine: VoiceRecord did finish - game audio volume will auto restore to 100%%");
+    
+    // 录音结束，执行保险措施：确保 OpenAL 上下文正常
+    // 注意：使用 DuckOthers 方案，音频会话切换时音量会自动恢复，这里是额外保险
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+        NSError *error = nil;
+        
+        ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] Checking audio session after recording, current category=%s", audioSession.category.UTF8String);
+        
+        // 确保音频会话类别正确（VoiceRecord 应该已经设置好了）
+        BOOL success = [audioSession setCategory:AVAudioSessionCategoryAmbient error:&error];
+        if (!success) {
+            ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] setCategory FAILED, error=%s", error ? error.description.UTF8String : "nil");
+        } else {
+            ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] setCategory confirmed");
+        }
+        
+        [audioSession setActive:YES error:&error];
+        if (error) {
+            ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] setActive FAILED, error=%s", error.description.UTF8String);
+        } else {
+            ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] setActive confirmed");
+        }
+        
+        // 【保险措施】重新激活 OpenAL 上下文，防止上下文失效导致静音
+        if (s_ALContext) {
+            ALCcontext *currentContext = alcGetCurrentContext();
+            if (currentContext != s_ALContext) {
+                ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] OpenAL context mismatch detected! Restoring...");
+            }
+            
+            if (!alcMakeContextCurrent(s_ALContext)) {
+                ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] alcMakeContextCurrent FAILED!");
+                
+                // 尝试检查OpenAL错误
+                ALenum alcError = alcGetError(s_ALDevice);
+                ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] ALC Error code: %d", alcError);
+            } else {
+                ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] alcMakeContextCurrent SUCCESS - OpenAL context verified");
+                
+                // 验证 OpenAL 状态
+                ALCint contextState;
+                alcGetIntegerv(s_ALDevice, ALC_SYNC, 1, &contextState);
+                ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] OpenAL context state=%d", contextState);
+            }
+        }
+    });
+}
+
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self name:AVAudioSessionInterruptionNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidBecomeActiveNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillResignActiveNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:@"VoiceRecordWillStartRecording" object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:@"VoiceRecordDidFinishRecording" object:nil];
 
     [super dealloc];
 }
@@ -189,14 +280,31 @@ bool AudioEngineImpl::init() {
     bool ret = false;
     do {
 #if CC_PLATFORM == CC_PLATFORM_IOS
+        ALOGI("[AUDIO_DEBUG] AudioEngine: Initializing audio engine");
         s_AudioEngineSessionHandler = [[AudioEngineSessionHandler alloc] init];
 #endif
 
         s_ALDevice = alcOpenDevice(nullptr);
+        
+        if (!s_ALDevice) {
+            ALOGE("[AUDIO_DEBUG] AudioEngine: alcOpenDevice FAILED");
+            break;
+        }
+        ALOGI("[AUDIO_DEBUG] AudioEngine: alcOpenDevice SUCCESS");
 
         if (s_ALDevice) {
             s_ALContext = alcCreateContext(s_ALDevice, nullptr);
-            alcMakeContextCurrent(s_ALContext);
+            if (!s_ALContext) {
+                ALOGE("[AUDIO_DEBUG] AudioEngine: alcCreateContext FAILED");
+                break;
+            }
+            ALOGI("[AUDIO_DEBUG] AudioEngine: alcCreateContext SUCCESS");
+            
+            if (!alcMakeContextCurrent(s_ALContext)) {
+                ALOGE("[AUDIO_DEBUG] AudioEngine: Initial alcMakeContextCurrent FAILED");
+                break;
+            }
+            ALOGI("[AUDIO_DEBUG] AudioEngine: Initial alcMakeContextCurrent SUCCESS");
 
             alGenSources(MAX_AUDIOINSTANCES, _alSources);
             auto alError = alGetError();
@@ -309,18 +417,35 @@ AudioCache *AudioEngineImpl::preload(const ccstd::string &filePath, std::functio
 
 int AudioEngineImpl::play2d(const ccstd::string &filePath, bool loop, float volume) {
     if (s_ALDevice == nullptr) {
+        ALOGE("[AUDIO_DEBUG] AudioEngine: play2d FAILED - s_ALDevice is null");
         return AudioEngine::INVALID_AUDIO_ID;
+    }
+
+    // 检查OpenAL上下文是否有效
+    ALCcontext *currentContext = alcGetCurrentContext();
+    if (currentContext != s_ALContext) {
+        ALOGE("[AUDIO_DEBUG] AudioEngine: play2d WARNING - OpenAL context mismatch! current=%p, expected=%p", currentContext, s_ALContext);
+        // 尝试恢复上下文
+        if (!alcMakeContextCurrent(s_ALContext)) {
+            ALOGE("[AUDIO_DEBUG] AudioEngine: play2d - Failed to restore OpenAL context");
+            return AudioEngine::INVALID_AUDIO_ID;
+        }
+        ALOGI("[AUDIO_DEBUG] AudioEngine: play2d - Successfully restored OpenAL context");
     }
 
     ALuint alSource = findValidSource();
     if (alSource == AL_INVALID) {
+        ALOGE("[AUDIO_DEBUG] AudioEngine: play2d FAILED - no valid source available");
         return AudioEngine::INVALID_AUDIO_ID;
     }
 
     auto *player = ccnew AudioPlayer;
     if (player == nullptr) {
+        ALOGE("[AUDIO_DEBUG] AudioEngine: play2d FAILED - cannot create AudioPlayer");
         return AudioEngine::INVALID_AUDIO_ID;
     }
+    
+    ALOGI("[AUDIO_DEBUG] AudioEngine: play2d - file=%s, loop=%d, volume=%.2f, audioID=%d", filePath.c_str(), loop, volume, _currentAudioID);
 
     player->_alSource = alSource;
     player->_loop = loop;
@@ -381,6 +506,7 @@ ALuint AudioEngineImpl::findValidSource() {
 
 void AudioEngineImpl::setVolume(int audioID, float volume) {
     if (!checkAudioIdValid(audioID)) {
+        ALOGE("[AUDIO_DEBUG] AudioEngine: setVolume FAILED - invalid audioID=%d", audioID);
         return;
     }
     auto player = _audioPlayers[audioID];
@@ -391,7 +517,9 @@ void AudioEngineImpl::setVolume(int audioID, float volume) {
 
         auto error = alGetError();
         if (error != AL_NO_ERROR) {
-            ALOGE("%s: audio id = %d, error = %x", __PRETTY_FUNCTION__, audioID, error);
+            ALOGE("[AUDIO_DEBUG] AudioEngine: setVolume FAILED - audio id=%d, volume=%.2f, error=%x", audioID, volume, error);
+        } else {
+            ALOGI("[AUDIO_DEBUG] AudioEngine: setVolume SUCCESS - audio id=%d, volume=%.2f", audioID, volume);
         }
     }
 }
@@ -424,6 +552,7 @@ void AudioEngineImpl::setLoop(int audioID, bool loop) {
 
 bool AudioEngineImpl::pause(int audioID) {
     if (!checkAudioIdValid(audioID)) {
+        ALOGE("[AUDIO_DEBUG] AudioEngine: pause FAILED - invalid audioID=%d", audioID);
         return false;
     }
     bool ret = true;
@@ -432,7 +561,9 @@ bool AudioEngineImpl::pause(int audioID) {
     auto error = alGetError();
     if (error != AL_NO_ERROR) {
         ret = false;
-        ALOGE("%s: audio id = %d, error = %x", __PRETTY_FUNCTION__, audioID, error);
+        ALOGE("[AUDIO_DEBUG] AudioEngine: pause FAILED - audio id=%d, error=%x", audioID, error);
+    } else {
+        ALOGI("[AUDIO_DEBUG] AudioEngine: pause SUCCESS - audio id=%d", audioID);
     }
 
     return ret;
@@ -440,15 +571,30 @@ bool AudioEngineImpl::pause(int audioID) {
 
 bool AudioEngineImpl::resume(int audioID) {
     if (!checkAudioIdValid(audioID)) {
+        ALOGE("[AUDIO_DEBUG] AudioEngine: resume FAILED - invalid audioID=%d", audioID);
         return false;
     }
+    
+    // 检查OpenAL上下文
+    ALCcontext *currentContext = alcGetCurrentContext();
+    if (currentContext != s_ALContext) {
+        ALOGE("[AUDIO_DEBUG] AudioEngine: resume WARNING - OpenAL context mismatch! Attempting to restore...");
+        if (!alcMakeContextCurrent(s_ALContext)) {
+            ALOGE("[AUDIO_DEBUG] AudioEngine: resume FAILED - cannot restore OpenAL context");
+            return false;
+        }
+        ALOGI("[AUDIO_DEBUG] AudioEngine: resume - OpenAL context restored");
+    }
+    
     bool ret = true;
     alSourcePlay(_audioPlayers[audioID]->_alSource);
 
     auto error = alGetError();
     if (error != AL_NO_ERROR) {
         ret = false;
-        ALOGE("%s: audio id = %d, error = %x", __PRETTY_FUNCTION__, audioID, error);
+        ALOGE("[AUDIO_DEBUG] AudioEngine: resume FAILED - audio id=%d, error=%x", audioID, error);
+    } else {
+        ALOGI("[AUDIO_DEBUG] AudioEngine: resume SUCCESS - audio id=%d", audioID);
     }
 
     return ret;
@@ -456,8 +602,10 @@ bool AudioEngineImpl::resume(int audioID) {
 
 void AudioEngineImpl::stop(int audioID) {
     if (!checkAudioIdValid(audioID)) {
+        ALOGE("[AUDIO_DEBUG] AudioEngine: stop FAILED - invalid audioID=%d", audioID);
         return;
     }
+    ALOGI("[AUDIO_DEBUG] AudioEngine: stop - audio id=%d", audioID);
     auto player = _audioPlayers[audioID];
     player->destroy();
 
@@ -466,6 +614,7 @@ void AudioEngineImpl::stop(int audioID) {
 }
 
 void AudioEngineImpl::stopAll() {
+    ALOGI("[AUDIO_DEBUG] AudioEngine: stopAll - stopping %d audio(s)", (int)_audioPlayers.size());
     for (auto &&player : _audioPlayers) {
         player.second->destroy();
     }
@@ -745,3 +894,4 @@ ccstd::vector<uint8_t> AudioEngineImpl::getOriginalPCMBuffer(const char *url, ui
     decoder.close();
     return pcmData;
 }
+
