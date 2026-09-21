@@ -67,6 +67,16 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
 }
 
 @property (nonatomic, assign) Boolean needReactiveContext;
+/** 避免重复排队重建音频引擎 */
+@property (nonatomic, assign) Boolean rebuildScheduled;
+/**
+ 广告正在展示中（由 PlatMgr 在所有广告回调的公共出口广播的 BKAudioAdStateChanged 维护）。
+ 只用来"暂时不抢音频会话"：广告期间 SDK 会自己接管 session，这时去改它会互相打架；
+ 广告结束会恢复。注意它不会让游戏静音，最坏情况只是这段时间不做兜底修复。
+ */
+@property (nonatomic, assign) Boolean adShowing;
+/** 本次广告开始的时间戳，用于兜底：广告结束回调没来时的超时恢复 */
+@property (nonatomic, assign) NSTimeInterval adStartTime;
 
 - (id)init;
 - (void)handleInterruption:(NSNotification *)notification;
@@ -74,21 +84,110 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
 - (void)reactiveAudio;
 - (void)handleVoiceRecordWillStart:(NSNotification *)notification;
 - (void)handleVoiceRecordDidFinish:(NSNotification *)notification;
+- (void)handleAdState:(NSNotification *)notification;
+- (void)handleMediaServicesWereReset:(NSNotification *)notification;
+- (void)handleRouteChange:(NSNotification *)notification;
+- (void)restoreAudioSession:(NSString *)reason;
+- (void)checkAndRestoreAudioSession:(NSString *)reason;
+- (void)scheduleRestoreAudioSession:(NSString *)reason;
+- (void)rebuildAudioEngine:(NSString *)reason;
+- (void)rebuildAudioEngineIfNeeded:(NSString *)reason;
 
 @end
+
+/** 广告播完后仍收不到结束通知时的兜底恢复时间（秒），只做恢复、不做挂起 */
+static const NSTimeInterval BK_AD_SHOWING_SAFETY_TIMEOUT = 120.0;
+
+/**
+ 录音/录音回放相关的类别：录音模块录制时用 PlayAndRecord，这类会话不能改成 Ambient（会让录音失效）。
+ 用"读会话状态"判断而不是靠通知标记，是因为录音模块是先切会话、再异步发通知，
+ 中间有空窗期，靠通知判断会误伤录音。
+ */
+static bool bkCategoryIsForRecording(NSString *category) {
+    return [category isEqualToString:AVAudioSessionCategoryPlayAndRecord] ||
+           [category isEqualToString:AVAudioSessionCategoryRecord];
+}
+
+/**
+ 把 AVAudioSession 拉回游戏期望的状态，并把 OpenAL 上下文重新挂上。
+ 广告SDK/录音等模块切走 session 后往往不会还原，这里统一做修复。
+ 只依赖文件级静态变量，所以音频引擎重建之后也能直接调用。
+ 返回 false 表示 OpenAL 上下文已不可用，需要重建 device/context。
+ */
+static bool bkRestoreAudioSession(const char *reason) {
+    if (s_ALDevice == nullptr || s_ALContext == nullptr) {
+        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): skip, OpenAL is not initialized", reason);
+        // 引擎尚未初始化（甚至还没被使用过）时不需要重建
+        return true;
+    }
+
+    AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+    NSError *error = nil;
+
+    // 1. 广告SDK常把 category 改成 Playback 且不还原，统一拉回 Ambient；
+    //    但录音相关类别不动（Ambient 没有录音能力，改它会把录音打断），
+    //    这种情况下只做激活和上下文重挂，类别收尾交给录音模块自己
+    NSString *categoryBefore = audioSession.category;
+    if (bkCategoryIsForRecording(categoryBefore)) {
+        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): category \"%s\" is for recording, keep it and only reactivate",
+              reason, categoryBefore.UTF8String);
+    } else if (![categoryBefore isEqualToString:AVAudioSessionCategoryAmbient]) {
+        error = nil;
+        BOOL success = [audioSession setCategory:AVAudioSessionCategoryAmbient error:&error];
+        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): category \"%s\" -> Ambient, success=%d, error=%s",
+              reason, categoryBefore.UTF8String, (int)success, error ? error.description.UTF8String : "nil");
+    }
+
+    // 2. 广告SDK关闭时可能把 session 置为 inactive，不重新激活的话 OpenAL 就再也没有输出了
+    error = nil;
+    BOOL active = [audioSession setActive:YES error:&error];
+    // outputVolume 一并打出来：万一是广告SDK把系统音量改成了0（有些SDK为了强推广告音量会这么干），
+    // 这行日志能直接看出来，避免继续在会话/上下文上排查
+    ALOGI("[AUDIO_DEBUG] AudioRestore(%s): setActive YES, success=%d, error=%s, category=%s, outputVolume=%.2f, otherAudioPlaying=%d",
+          reason, (int)active, error ? error.description.UTF8String : "nil",
+          audioSession.category.UTF8String, audioSession.outputVolume, (int)audioSession.isOtherAudioPlaying);
+
+    // 3. 重新挂上 OpenAL 上下文：上下文被摘掉后即使不报错也不会出声，必须重新挂上
+    if (alcGetCurrentContext() == s_ALContext) {
+        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): OpenAL context is current", reason);
+        return true;
+    }
+    if (alcMakeContextCurrent(s_ALContext)) {
+        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): OpenAL context re-activated", reason);
+        return true;
+    }
+
+    ALOGE("[AUDIO_DEBUG] AudioRestore(%s): alcMakeContextCurrent FAILED", reason);
+    return false;
+}
 
 @implementation AudioEngineSessionHandler
 
 
 - (id)init {
     if (self = [super init]) {
+        self.needReactiveContext = false;
+        self.rebuildScheduled = false;
+        self.adShowing = false;
+        self.adStartTime = 0;
+
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleInterruption:) name:AVAudioSessionInterruptionNotification object:[AVAudioSession sharedInstance]];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(resumeAudio:) name:UIApplicationDidBecomeActiveNotification object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(resumeAudio:) name:UIApplicationWillEnterForegroundNotification object:nil];
+
+        // 系统媒体服务被重置（audiomxd 崩溃重启）后，OpenAL 的 device/context 会变成不可用的僵尸对象，
+        // 按 Apple 的要求必须销毁重建，只切上下文是无效的
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleMediaServicesWereReset:) name:AVAudioSessionMediaServicesWereResetNotification object:[AVAudioSession sharedInstance]];
+        // 音频路由变化（插拔耳机/蓝牙）后同样要确认 session 与上下文可用
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleRouteChange:) name:AVAudioSessionRouteChangeNotification object:[AVAudioSession sharedInstance]];
         
         // 监听录音模块的通知
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleVoiceRecordWillStart:) name:@"VoiceRecordWillStartRecording" object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleVoiceRecordDidFinish:) name:@"VoiceRecordDidFinishRecording" object:nil];
+
+        // 监听广告开关：广告SDK播放视频时会自己切换 AVAudioSession，结束后往往不还原，
+        // 这是"看广告回来没音效"的根因；广告开始只记录，广告结束做恢复
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleAdState:) name:@"BKAudioAdStateChanged" object:nil];
         
         NSError *error = nil;
         BOOL success = [[AVAudioSession sharedInstance]
@@ -103,41 +202,110 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
     return self;
 }
 
-- (void)reactiveAudio {
-    if (self.needReactiveContext) {
-        self.needReactiveContext = false;
-        ALOGI("[AUDIO_DEBUG] AudioEngine: reactiveAudio - attempting to restore audio context");
-        
-        AVAudioSession *audioSession = [AVAudioSession sharedInstance];
-        NSError *error = nil;
-        
-        ALOGI("[AUDIO_DEBUG] AudioEngine: Current audio session category=%s, isOtherAudioPlaying=%d", 
-              audioSession.category.UTF8String, audioSession.isOtherAudioPlaying);
-        
-        BOOL success = [audioSession setCategory:AVAudioSessionCategoryAmbient error:&error];
-        if (!success) {
-            ALOGE("[AUDIO_DEBUG] AudioEngine: Fail to set audio session, error=%s", error ? error.description.UTF8String : "nil");
+- (void)restoreAudioSession:(NSString *)reason {
+    if (!bkRestoreAudioSession(reason.UTF8String)) {
+        [self rebuildAudioEngine:@"contextRestoreFailed"];
+    }
+    self.needReactiveContext = false;
+}
+
+- (void)checkAndRestoreAudioSession:(NSString *)reason {
+    // 后台/过渡态不要去激活音频会话，回到前台时 resumeAudio 会统一恢复
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+        return;
+    }
+    // 广告展示期间 SDK 自己接管了 session，这时去改它等于和广告SDK互相打架
+    // （可能让广告声音变小/静音），等广告结束的恢复来处理；超时兜底会保证不会一直不做
+    if (self.adShowing) {
+        return;
+    }
+
+    // 正常情况下 category 就是 Ambient，这里只是一次字符串比较，开销可忽略；
+    // 只有确认被外部模块改过（广告SDK/视频播放器等改完不还原）才动手，不做任何投机性操作
+    AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+    NSString *category = audioSession.category;
+    if ([category isEqualToString:AVAudioSessionCategoryAmbient]) {
+        return;
+    }
+    // 录音相关类别（PlayAndRecord/Record）是录音模块按需切的，不去打扰；
+    // 用会话状态判断而不是用通知标记，避免"先切会话后发通知"的空窗期误伤录音
+    if (bkCategoryIsForRecording(category)) {
+        return;
+    }
+
+    ALOGI("[AUDIO_DEBUG] AudioRestore(%s): session category is \"%s\", changed by other module - restoring",
+          reason.UTF8String, category.UTF8String);
+    [self restoreAudioSession:reason];
+}
+
+- (void)scheduleRestoreAudioSession:(NSString *)reason {
+    [self restoreAudioSession:reason];
+
+    // 广告/录音等SDK往往在自己的回调栈里才做音频会话收尾，只恢复一次可能会被它们改回去，
+    // 因此再补几次延迟恢复（幂等操作，重复执行无副作用）
+    NSTimeInterval delays[] = {0.2, 0.8, 2.0};
+    for (int i = 0; i < 3; ++i) {
+        NSTimeInterval delay = delays[i]; // 每轮捕获一个标量，避免block捕获到局部数组指针
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self restoreAudioSession:@"delayed"];
+        });
+    }
+}
+
+- (void)rebuildAudioEngineIfNeeded:(NSString *)reason {
+    // 延迟一点再判断：有些失败是瞬时的（例如中断过程中音频硬件还没交还）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (s_ALDevice == nullptr || s_ALContext == nullptr) {
             return;
         }
-        ALOGI("[AUDIO_DEBUG] AudioEngine: setCategory SUCCESS");
-        
-        [audioSession setActive:YES error:&error];
-        if (error) {
-            ALOGE("[AUDIO_DEBUG] AudioEngine: setActive FAILED, error=%s", error.description.UTF8String);
-        } else {
-            ALOGI("[AUDIO_DEBUG] AudioEngine: setActive SUCCESS");
+        if (alcGetCurrentContext() == s_ALContext) {
+            ALOGI("[AUDIO_DEBUG] AudioRebuild(%s): canceled, OpenAL context is fine now", reason.UTF8String);
+            return;
         }
-        
-        if (!alcMakeContextCurrent(s_ALContext)) {
-            ALOGE("[AUDIO_DEBUG] AudioEngine: alcMakeContextCurrent FAILED - audio context is invalid, need to recreate!");
-        } else {
-            ALOGI("[AUDIO_DEBUG] AudioEngine: alcMakeContextCurrent SUCCESS - OpenAL context restored");
+        [self rebuildAudioEngine:reason];
+    });
+}
+
+- (void)rebuildAudioEngine:(NSString *)reason {
+    if (self.rebuildScheduled) {
+        return;
+    }
+    // 音频引擎还没初始化过（游戏还没播过声音）就没什么可重建的，
+    // 更不能在这里反向触发初始化：那会平白创建音频设备并改动音频会话
+    if (s_ALDevice == nullptr && s_ALContext == nullptr) {
+        ALOGI("[AUDIO_DEBUG] AudioRebuild(%s): skip, audio engine was never initialized", reason.UTF8String);
+        return;
+    }
+    self.rebuildScheduled = true;
+    ALOGW("[AUDIO_DEBUG] AudioRebuild(%s): scheduling OpenAL device/context rebuild", reason.UTF8String);
+
+    // 必须异步执行：end() 会析构 AudioEngineImpl（也就是本对象的持有者），在回调栈里直接调用等于删掉自己
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.rebuildScheduled = false;
+        ALOGW("[AUDIO_DEBUG] AudioRebuild: end() + lazyInit() begin");
+        AudioEngine::end();
+        bool success = AudioEngine::lazyInit();
+        ALOGW("[AUDIO_DEBUG] AudioRebuild: lazyInit result=%d", (int)success);
+        if (success) {
+            bkRestoreAudioSession("rebuildDone");
         }
+        ALOGW("[AUDIO_DEBUG] AudioRebuild: done. All previous audio players were dropped, "
+              "next play2d will recreate the OpenAL device/context");
+    });
+}
+
+- (void)reactiveAudio {
+    if (self.needReactiveContext) {
+        ALOGI("[AUDIO_DEBUG] AudioRestore: reactiveAudio, needReactiveContext was set");
+        [self restoreAudioSession:@"reactive"];
     }
 }
 
 - (void)resumeAudio:(NSNotification *)notification {
+    // 保持引擎原有行为：系统打断结束（或应用回到前台）时按标记恢复一次
     [self reactiveAudio];
+    // 再补一次"有证据才动手"的检查：广告/视频等外部模块改了 session 又不还原时，category 能看出来
+    [self checkAndRestoreAudioSession:@"appActive"];
 }
 
 - (void)handleInterruption:(NSNotification *)notification {
@@ -161,61 +329,77 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
 - (void)handleVoiceRecordWillStart:(NSNotification *)notification {
     ALOGI("[AUDIO_DEBUG] AudioEngine: VoiceRecord will start - game audio will be ducked (auto reduced to ~20%% volume)");
     // 录音即将开始
-    // 使用了 PlayAndRecord + DuckOthers 方案：
+    // 使用了 PlayAndRecord + MixWithOthers 方案：
     // - 游戏音效不会中断，只是音量自动降低到约 20%
     // - 录音结束后音量会自动恢复到 100%
     // - 不需要手动干预，系统自动处理
+    // 注意：这里不做任何事，引擎侧的检查是按会话类别判断是否在录音的（录音模块先切会话、后发本通知）
 }
 
 - (void)handleVoiceRecordDidFinish:(NSNotification *)notification {
-    ALOGI("[AUDIO_DEBUG] AudioEngine: VoiceRecord did finish - game audio volume will auto restore to 100%%");
-    
-    // 录音结束，执行保险措施：确保 OpenAL 上下文正常
-    // 注意：使用 DuckOthers 方案，音频会话切换时音量会自动恢复，这里是额外保险
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        AVAudioSession *audioSession = [AVAudioSession sharedInstance];
-        NSError *error = nil;
-        
-        ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] Checking audio session after recording, current category=%s", audioSession.category.UTF8String);
-        
-        // 确保音频会话类别正确（VoiceRecord 应该已经设置好了）
-        BOOL success = [audioSession setCategory:AVAudioSessionCategoryAmbient error:&error];
-        if (!success) {
-            ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] setCategory FAILED, error=%s", error ? error.description.UTF8String : "nil");
-        } else {
-            ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] setCategory confirmed");
-        }
-        
-        [audioSession setActive:YES error:&error];
-        if (error) {
-            ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] setActive FAILED, error=%s", error.description.UTF8String);
-        } else {
-            ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] setActive confirmed");
-        }
-        
-        // 【保险措施】重新激活 OpenAL 上下文，防止上下文失效导致静音
-        if (s_ALContext) {
-            ALCcontext *currentContext = alcGetCurrentContext();
-            if (currentContext != s_ALContext) {
-                ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] OpenAL context mismatch detected! Restoring...");
+    ALOGI("[AUDIO_DEBUG] AudioRestore: voice record did finish");
+    // 录音结束：录音模块会把 session 从 PlayAndRecord 切回 Ambient，这里补上一次恢复，
+    // 保证 OpenAL 上下文可用（录音后没音效也是历史上踩过的坑）
+    [self scheduleRestoreAudioSession:@"recordDone"];
+}
+
+- (void)handleAdState:(NSNotification *)notification {
+    NSString *state = [[notification userInfo] objectForKey:@"state"];
+
+    if ([state isEqualToString:@"start"]) {
+        // 广告开始：只记录"广告展示中"，不主动改音频会话（宁可不作为，也不能让游戏变哑）。
+        // 这个标记的作用是让兜底检查在广告期间先别动手，避免和广告SDK互相抢 session
+        self.adShowing = true;
+        self.adStartTime = [[NSDate date] timeIntervalSince1970];
+        ALOGI("[AUDIO_DEBUG] AudioAd: ad will show - pause periodic audio session repair");
+
+        // 兜底：广告开始后如果一直没收到结束通知（SDK异常/被系统回收），超时后恢复一次。
+        // 这里只做恢复、不做任何挂起，所以最坏情况只是多恢复一次，不会让游戏变哑
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(BK_AD_SHOWING_SAFETY_TIMEOUT * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!self.adShowing) {
+                return;
             }
-            
-            if (!alcMakeContextCurrent(s_ALContext)) {
-                ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] alcMakeContextCurrent FAILED!");
-                
-                // 尝试检查OpenAL错误
-                ALenum alcError = alcGetError(s_ALDevice);
-                ALOGE("[AUDIO_DEBUG] AudioEngine: [Insurance] ALC Error code: %d", alcError);
-            } else {
-                ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] alcMakeContextCurrent SUCCESS - OpenAL context verified");
-                
-                // 验证 OpenAL 状态
-                ALCint contextState;
-                alcGetIntegerv(s_ALDevice, ALC_SYNC, 1, &contextState);
-                ALOGI("[AUDIO_DEBUG] AudioEngine: [Insurance] OpenAL context state=%d", contextState);
+            NSTimeInterval shownFor = [[NSDate date] timeIntervalSince1970] - self.adStartTime;
+            if (shownFor < BK_AD_SHOWING_SAFETY_TIMEOUT - 10.0) {
+                // 期间又播了新的广告，等它自己那次的兜底
+                return;
             }
-        }
-    });
+            ALOGW("[AUDIO_DEBUG] AudioAd: still marked as showing after %.0fs "
+                  "(missing close callback) - restoring audio session and resuming repair",
+                  shownFor);
+            self.adShowing = false;
+            self.adStartTime = 0;
+            [self scheduleRestoreAudioSession:@"adNoCloseCallback"];
+        });
+        return;
+    }
+
+    if ([state isEqualToString:@"close"]) {
+        ALOGI("[AUDIO_DEBUG] AudioAd: ad did close - restoring audio session");
+        // 广告播放期间广告SDK会自己切换 AVAudioSession（category/active）且结束时往往不还原，
+        // 这是"看完广告回来没音效"的根因，这里统一恢复
+        self.adShowing = false;
+        self.adStartTime = 0;
+        [self scheduleRestoreAudioSession:@"adClose"];
+        return;
+    }
+
+    ALOGW("[AUDIO_DEBUG] AudioAd: unknown ad state \"%s\"", state.UTF8String);
+}
+
+- (void)handleMediaServicesWereReset:(NSNotification *)notification {
+    // 媒体服务被系统重置：所有音频对象（含 OpenAL 的 device/context）都成了僵尸对象，
+    // 按 Apple 文档必须销毁重建，光切换上下文是没用的
+    ALOGW("[AUDIO_DEBUG] AudioRestore: media services were reset");
+    [self rebuildAudioEngine:@"mediaServicesReset"];
+}
+
+- (void)handleRouteChange:(NSNotification *)notification {
+    NSInteger reason = [[[notification userInfo] objectForKey:AVAudioSessionRouteChangeReasonKey] integerValue];
+    ALOGI("[AUDIO_DEBUG] AudioRoute: route changed (reason=%ld) - checking audio session", (long)reason);
+    // 只做"有证据才动手"的检查：正常情况下 category 仍是 Ambient，这里什么都不做；
+    // 只有在路由变化过程中被外部模块改坏时才恢复
+    [self checkAndRestoreAudioSession:@"routeChange"];
 }
 
 - (void)dealloc {
@@ -224,6 +408,9 @@ static ALenum alSourceAddNotificationExt(ALuint sid, ALuint notificationID, alSo
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationWillResignActiveNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"VoiceRecordWillStartRecording" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"VoiceRecordDidFinishRecording" object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVAudioSessionMediaServicesWereResetNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVAudioSessionRouteChangeNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:@"BKAudioAdStateChanged" object:nil];
 
     [super dealloc];
 }
@@ -235,6 +422,10 @@ static id s_AudioEngineSessionHandler = nullptr;
 ALvoid AudioEngineImpl::myAlSourceNotificationCallback(ALuint sid, ALuint notificationID, ALvoid *userData) {
     // Currently, we only care about AL_BUFFERS_PROCESSED event
     if (notificationID != AL_BUFFERS_PROCESSED)
+        return;
+
+    // 该回调由 OpenAL 内部线程发起，析构（应用退出/音频引擎重建）过程中可能与之并发，先判空
+    if (s_instance == nullptr)
         return;
 
     AudioPlayer *player = nullptr;
@@ -254,6 +445,9 @@ AudioEngineImpl::AudioEngineImpl()
 }
 
 AudioEngineImpl::~AudioEngineImpl() {
+    // 先断开全局实例引用：OpenAL 内部线程的通知回调会用到它
+    s_instance = nullptr;
+
     if (auto sche = _scheduler.lock()) {
         sche->unschedule("AudioEngine", this);
     }
@@ -265,15 +459,18 @@ AudioEngineImpl::~AudioEngineImpl() {
 
         alcMakeContextCurrent(nullptr);
         alcDestroyContext(s_ALContext);
+        // 置空静态指针：销毁/重建后，延迟回调不能再操作悬空指针
+        s_ALContext = nullptr;
     }
     if (s_ALDevice) {
         alcCloseDevice(s_ALDevice);
+        s_ALDevice = nullptr;
     }
 
 #if CC_PLATFORM == CC_PLATFORM_IOS
     [s_AudioEngineSessionHandler release];
+    s_AudioEngineSessionHandler = nullptr;
 #endif
-    s_instance = nullptr;
 }
 
 bool AudioEngineImpl::init() {
@@ -422,15 +619,40 @@ int AudioEngineImpl::play2d(const ccstd::string &filePath, bool loop, float volu
     }
 
     // 检查OpenAL上下文是否有效
-    ALCcontext *currentContext = alcGetCurrentContext();
-    if (currentContext != s_ALContext) {
-        ALOGE("[AUDIO_DEBUG] AudioEngine: play2d WARNING - OpenAL context mismatch! current=%p, expected=%p", currentContext, s_ALContext);
-        // 尝试恢复上下文
-        if (!alcMakeContextCurrent(s_ALContext)) {
-            ALOGE("[AUDIO_DEBUG] AudioEngine: play2d - Failed to restore OpenAL context");
-            return AudioEngine::INVALID_AUDIO_ID;
+    {
+#if CC_PLATFORM == CC_PLATFORM_IOS
+        // 低频兜底：外部模块（广告SDK等）改过音频会话后会一直静音，这里每秒最多检查一次（健康时什么都不做）
+        static double s_lastSessionCheckTime = 0;
+        double nowTime = [[NSDate date] timeIntervalSince1970];
+        if (nowTime - s_lastSessionCheckTime >= 1.0) {
+            s_lastSessionCheckTime = nowTime;
+            if (s_AudioEngineSessionHandler != nullptr) {
+                [s_AudioEngineSessionHandler checkAndRestoreAudioSession:@"play2d"];
+            }
         }
-        ALOGI("[AUDIO_DEBUG] AudioEngine: play2d - Successfully restored OpenAL context");
+#endif
+        ALCcontext *currentContext = alcGetCurrentContext();
+        if (currentContext != s_ALContext) {
+            ALOGE("[AUDIO_DEBUG] AudioEngine: play2d WARNING - OpenAL context mismatch! current=%p, expected=%p", currentContext, s_ALContext);
+#if CC_PLATFORM == CC_PLATFORM_IOS
+            // 又要出声了：说明中断/广告等场景已经结束，这里做一次完整恢复（session + 上下文）
+            if (s_AudioEngineSessionHandler != nullptr) {
+                [s_AudioEngineSessionHandler restoreAudioSession:@"play2d"];
+                currentContext = alcGetCurrentContext();
+            }
+#endif
+            // 尝试恢复上下文
+            if (currentContext != s_ALContext && !alcMakeContextCurrent(s_ALContext)) {
+                ALOGE("[AUDIO_DEBUG] AudioEngine: play2d - Failed to restore OpenAL context");
+#if CC_PLATFORM == CC_PLATFORM_IOS
+                if (s_AudioEngineSessionHandler != nullptr) {
+                    [s_AudioEngineSessionHandler rebuildAudioEngineIfNeeded:@"play2dContextFailed"];
+                }
+#endif
+                return AudioEngine::INVALID_AUDIO_ID;
+            }
+            ALOGI("[AUDIO_DEBUG] AudioEngine: play2d - Successfully restored OpenAL context");
+        }
     }
 
     ALuint alSource = findValidSource();
@@ -719,6 +941,19 @@ void AudioEngineImpl::update(float dt) {
     ALuint alSource;
 
     //    ALOGV("AudioPlayer count: %d", (int)_audioPlayers.size());
+
+#if CC_PLATFORM == CC_PLATFORM_IOS
+    // 有音频在播的时候每5秒兜底检查一次音频会话是否被外部模块（广告SDK等）改坏；
+    // 正常情况下只做一次字符串比较，开销可忽略
+    static float s_sessionCheckElapsed = 0.0f;
+    s_sessionCheckElapsed += dt;
+    if (s_sessionCheckElapsed >= 5.0f) {
+        s_sessionCheckElapsed = 0.0f;
+        if (s_AudioEngineSessionHandler != nullptr) {
+            [s_AudioEngineSessionHandler checkAndRestoreAudioSession:@"update"];
+        }
+    }
+#endif
 
     for (auto it = _audioPlayers.begin(); it != _audioPlayers.end();) {
         audioID = it->first;
