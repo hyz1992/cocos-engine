@@ -105,9 +105,49 @@ export class OneShotAudio {
 }
 
 export class AudioPlayer implements OperationQueueable {
+    private static readonly _players = new Set<AudioPlayer>();
+    private static _nativeSessionReady = true;
+
+    /** @internal Native iOS recovery callbacks share the existing jsb event dispatcher. */
+    static _initNativeRecovery (): void {
+        if (systemInfo.platform !== Platform.IOS) return;
+        const events = jsb as typeof jsb & {
+            onAudioSessionSuspended?: () => void;
+            onAudioEngineWillReset?: () => void;
+            onAudioSessionReady?: () => void;
+            onAudioEngineRecoveryCancelled?: () => void;
+        };
+        events.onAudioSessionSuspended = (): void => { AudioPlayer._nativeSessionReady = false; };
+        events.onAudioEngineWillReset = (): void => {
+            AudioPlayer._nativeSessionReady = false;
+            for (const player of Array.from(AudioPlayer._players)) {
+                try { player._prepareNativeReset(); } catch (err) { console.error(err); }
+            }
+        };
+        events.onAudioEngineRecoveryCancelled = (): void => {
+            AudioPlayer._nativeSessionReady = false;
+            for (const player of AudioPlayer._players) {
+                player._resumePending = false;
+                ++player._playGeneration;
+                player._id = INVALID_AUDIO_ID;
+                player._state = AudioState.STOPPED;
+                player._cachedState.currentTime = 0;
+            }
+        };
+        events.onAudioSessionReady = (): void => {
+            AudioPlayer._nativeSessionReady = true;
+            for (const player of AudioPlayer._players) {
+                if (player._resumePending) player._recover().catch(() => {});
+            }
+        };
+    }
     private _url: string;
     private _id: number = INVALID_AUDIO_ID;
     private _state: AudioState = AudioState.INIT;
+    private _playGeneration = 0;
+    private _resumePending = false;
+    private _userPaused = false;
+    private _destroyed = false;
     private _pcmHeader: jsb.PCMHeader | null;
 
     /**
@@ -131,11 +171,17 @@ export class AudioPlayer implements OperationQueueable {
         this._url = url;
         // this._pcmHeader = audioEngine.getPCMHeader(url);
         this._pcmHeader = null;
+        if (systemInfo.platform === Platform.IOS) AudioPlayer._players.add(this);
         // event
         game.on(Game.EVENT_PAUSE, this._onInterruptedBegin, this);
         game.on(Game.EVENT_RESUME, this._onInterruptedEnd, this);
     }
     destroy (): void {
+        if (this._destroyed) return;
+        this._destroyed = true;
+        this._resumePending = false;
+        ++this._playGeneration;
+        AudioPlayer._players.delete(this);
         game.off(Game.EVENT_PAUSE, this._onInterruptedBegin, this);
         game.off(Game.EVENT_RESUME, this._onInterruptedEnd, this);
         if (--urlCount[this._url] <= 0) {
@@ -143,19 +189,49 @@ export class AudioPlayer implements OperationQueueable {
         }
     }
     private _onInterruptedBegin (): void {
-        if (this._state === AudioState.PLAYING) {
-            this.pause().then(() => {
-                this._state = AudioState.INTERRUPTED;
-                this._eventTarget.emit(AudioEvent.INTERRUPTION_BEGIN);
-            }).catch((e) => {});
+        if (!this._userPaused && this._state === AudioState.PLAYING) {
+            this._resumePending = true;
+            this.pause(true).then(() => {
+                if (!this._destroyed && this._resumePending && this._state === AudioState.PAUSED) {
+                    this._state = AudioState.INTERRUPTED;
+                    this._eventTarget.emit(AudioEvent.INTERRUPTION_BEGIN);
+                }
+            }).catch(() => {});
         }
     }
     private _onInterruptedEnd (): void {
-        if (this._state === AudioState.INTERRUPTED) {
-            this.play().then(() => {
-                this._eventTarget.emit(AudioEvent.INTERRUPTION_END);
-            }).catch((e) => {});
+        // 状态更新可能仍在操作队列中；以可同步撤销的续播意图为准。
+        if (this._resumePending) {
+            this._recover().catch(() => {});
         }
+    }
+    private _prepareNativeReset (): void {
+        // 原生重建只续播循环音乐；一次性音效可能已经结束，不能重新发声。
+        if (this._userPaused || !this._cachedState.loop) {
+            this._resumePending = false;
+            return;
+        }
+        if (this._state === AudioState.PLAYING || this._state === AudioState.INTERRUPTED || this._resumePending) {
+            const wasPlaying = this._state === AudioState.PLAYING;
+            this._resumePending = true;
+            ++this._playGeneration;
+            this._state = AudioState.INTERRUPTED;
+            if (wasPlaying) this._eventTarget.emit(AudioEvent.INTERRUPTION_BEGIN);
+        }
+    }
+    @enqueueOperation
+    private _recover (): Promise<void> {
+        if (this._destroyed || this._userPaused || !this._resumePending || !AudioPlayer._nativeSessionReady || game.isPaused()) {
+            return Promise.resolve();
+        }
+        // 原生前台监听可能曾在上下文尚未恢复时 resume，并把缓存状态标为 PLAYING。
+        // pause/resume 不回到开头，能在会话可用后真正重新提交播放。
+        if (this._isValid) audioEngine.pause(this._id);
+        return this._playImpl().then(() => {
+            if (!this._destroyed && this._state === AudioState.PLAYING) {
+                this._eventTarget.emit(AudioEvent.INTERRUPTION_END);
+            }
+        });
     }
     static load (url: string, opts?: AudioLoadOptions): Promise<AudioPlayer> {
         return new Promise((resolve, reject) => {
@@ -194,7 +270,21 @@ export class AudioPlayer implements OperationQueueable {
     }
     static readonly maxAudioChannel: number = audioEngine.getMaxAudioInstance();
 
+    private _syncNativeState (): void {
+        // native end()/重建不会发送 finish callback。getState 的 ERROR 为 -1，
+        // 发现播放器已被丢弃后重新走 play2d，并保留缓存的 loop/volume。
+        if (this._id !== INVALID_AUDIO_ID && audioEngine.getState(this._id) === INVALID_AUDIO_ID) {
+            this._id = INVALID_AUDIO_ID;
+            // 前台恢复仍需知道它曾被中断；状态查询不能吞掉自动续播请求。
+            if (this._state !== AudioState.INTERRUPTED) {
+                this._state = AudioState.INIT;
+            }
+            this._cachedState.currentTime = 0;
+        }
+    }
+
     private get _isValid (): boolean {
+        this._syncNativeState();
         return this._id !== INVALID_AUDIO_ID;
     }
 
@@ -205,6 +295,7 @@ export class AudioPlayer implements OperationQueueable {
         return AudioType.NATIVE_AUDIO;
     }
     get state (): AudioState {
+        this._syncNativeState();
         return this._state;
     }
     get loop (): boolean {
@@ -279,8 +370,21 @@ export class AudioPlayer implements OperationQueueable {
 
     @enqueueOperation
     play (): Promise<void> {
+        this._userPaused = false;
+        return this._playImpl();
+    }
+
+    private _playImpl (): Promise<void> {
         return new Promise((resolve) => {
+            if (this._destroyed) { resolve(); return; }
             if (this._isValid) {
+                // 旧 ID 仍存在不代表会话可用，不能把一次失败的 resume 当作成功。
+                if (systemInfo.platform === Platform.IOS && !AudioPlayer._nativeSessionReady) {
+                    this._resumePending = true;
+                    this._state = AudioState.INTERRUPTED;
+                    resolve();
+                    return;
+                }
                 if (this._state === AudioState.PAUSED || this._state === AudioState.INTERRUPTED) {
                     audioEngine.resume(this._id);
                 } else if (this._state === AudioState.PLAYING) {
@@ -289,6 +393,7 @@ export class AudioPlayer implements OperationQueueable {
                     audioEngine.resume(this._id);
                 }
             } else {
+                const generation = ++this._playGeneration;
                 this._id = audioEngine.play2d(this._url, this._cachedState.loop, this._cachedState.volume);
                 if (this._isValid) {
                     if (this._cachedState.currentTime !== 0) {
@@ -296,20 +401,39 @@ export class AudioPlayer implements OperationQueueable {
                         this._cachedState.currentTime = 0;
                     }
                     audioEngine.setFinishCallback(this._id, () => {
+                        // 原生结束回调可能已排队；不能清掉后续 play() 创建的新播放器。
+                        if (generation !== this._playGeneration) {
+                            return;
+                        }
                         this._cachedState.currentTime = 0;
                         this._id = INVALID_AUDIO_ID;
                         this._state = AudioState.INIT;
+                        this._resumePending = false;
                         this._eventTarget.emit(AudioEvent.ENDED);
                     });
                 }
             }
-            this._state = AudioState.PLAYING;
+            this._state = this._isValid ? AudioState.PLAYING : AudioState.INIT;
+            if (this._state === AudioState.PLAYING) {
+                this._resumePending = false;
+            } else if (systemInfo.platform === Platform.IOS && this._cachedState.loop) {
+                this._resumePending = true;
+            }
             resolve();
         });
     }
 
+    pause (forInterruption = false): Promise<void> {
+        // 手动暂停立即撤销待续播；不能让稍后到来的自动恢复挤掉队列中的暂停。
+        if (!forInterruption) {
+            this._resumePending = false;
+            this._userPaused = true;
+        }
+        return this._pause();
+    }
+
     @enqueueOperation
-    pause (): Promise<void> {
+    private _pause (): Promise<void> {
         return new Promise((resolve) => {
             if (this._isValid) {
                 audioEngine.pause(this._id);
@@ -322,6 +446,8 @@ export class AudioPlayer implements OperationQueueable {
     @enqueueOperation
     stop (): Promise<void> {
         return new Promise((resolve) => {
+            this._resumePending = false;
+            ++this._playGeneration;
             if (this._isValid) {
                 audioEngine.stop(this._id);
             }
@@ -338,6 +464,8 @@ export class AudioPlayer implements OperationQueueable {
     onEnded (cb: () => void): void { this._eventTarget.on(AudioEvent.ENDED, cb); }
     offEnded (cb?: () => void): void { this._eventTarget.off(AudioEvent.ENDED, cb); }
 }
+
+AudioPlayer._initNativeRecovery();
 
 // REMOVE_ME
 legacyCC.AudioPlayer = AudioPlayer;

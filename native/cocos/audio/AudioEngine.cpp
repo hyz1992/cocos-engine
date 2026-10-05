@@ -146,6 +146,9 @@ private:
 };
 
 void AudioEngine::end() {
+#if CC_PLATFORM == CC_PLATFORM_IOS
+    AudioEngineImpl::clearFailedRebuildHandler();
+#endif
     stopAll();
 
     if (sThreadPool) {
@@ -165,6 +168,9 @@ void AudioEngine::end() {
 
 bool AudioEngine::lazyInit() {
     if (sAudioEngineImpl == nullptr) {
+#if CC_PLATFORM == CC_PLATFORM_IOS
+        if (!AudioEngineImpl::canInitialize()) return false;
+#endif
         sAudioEngineImpl = ccnew AudioEngineImpl();
         if (!sAudioEngineImpl || !sAudioEngineImpl->init()) {
             delete sAudioEngineImpl;

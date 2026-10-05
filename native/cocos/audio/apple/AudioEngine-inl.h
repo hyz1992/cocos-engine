@@ -43,6 +43,8 @@ public:
     ~AudioEngineImpl();
 
     bool init();
+    static bool canInitialize();
+    static void clearFailedRebuildHandler(bool cancelRecovery = true);
     int play2d(const ccstd::string &fileFullPath, bool loop, float volume);
     void setVolume(int audioID, float volume);
     void setLoop(int audioID, bool loop);
@@ -85,7 +87,6 @@ private:
 
     bool _lazyInitLoop;
 
-    int _currentAudioID;
     std::weak_ptr<Scheduler> _scheduler;
 };
 } // namespace cc
