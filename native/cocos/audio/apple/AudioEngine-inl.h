@@ -73,7 +73,7 @@ private:
 
     static ALvoid myAlSourceNotificationCallback(ALuint sid, ALuint notificationID, ALvoid *userData);
 
-    ALuint _alSources[MAX_AUDIOINSTANCES];
+    ALuint _alSources[MAX_AUDIOINSTANCES]{};
 
     //source,used
     ccstd::list<ALuint> _unusedSourcesPool;

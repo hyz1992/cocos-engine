@@ -229,7 +229,8 @@ export class AudioPlayer implements OperationQueueable {
         if (this._isValid) audioEngine.pause(this._id);
         return this._playImpl().then(() => {
             if (!this._destroyed && this._state === AudioState.PLAYING) {
-                this._eventTarget.emit(AudioEvent.INTERRUPTION_END);
+                // 消费者回调异常不能让本次操作 reject，继而堵住后续播放/暂停队列。
+                try { this._eventTarget.emit(AudioEvent.INTERRUPTION_END); } catch (err) { console.error(err); }
             }
         });
     }

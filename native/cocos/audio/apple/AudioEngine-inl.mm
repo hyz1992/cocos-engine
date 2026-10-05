@@ -555,6 +555,11 @@ AudioEngineImpl::~AudioEngineImpl() {
     if (s_ALContext) {
         alDeleteSources(MAX_AUDIOINSTANCES, _alSources);
 
+        // AudioEngine::end() 已停止并 join 加载线程池，排队但尚未开始的任务会被丢弃。
+        // 此时没有读取线程；标记跳过，避免缓存析构等待一个永远不会执行的任务。
+        for (auto &entry : _audioCaches) {
+            entry.second.setSkipReadDataTask(true);
+        }
         _audioCaches.clear();
 
         alcMakeContextCurrent(nullptr);
@@ -569,7 +574,8 @@ AudioEngineImpl::~AudioEngineImpl() {
 
 #if CC_PLATFORM == CC_PLATFORM_IOS
     auto *sessionHandler = s_AudioEngineSessionHandler;
-    s_AudioEngineSessionHandler = nil;
+    // 客户端播放/预加载也会调用 lazyInit；失败时仍保留旧观察者与恢复请求。
+    s_AudioEngineSessionHandler = s_failedRebuildHandler;
     [sessionHandler release];
 #endif
 }
@@ -579,7 +585,6 @@ bool AudioEngineImpl::init() {
     do {
 #if CC_PLATFORM == CC_PLATFORM_IOS
         ALOGI("[AUDIO_DEBUG] AudioEngine: Initializing audio engine");
-        clearFailedRebuildHandler(false);
         s_AudioEngineSessionHandler = [[AudioEngineSessionHandler alloc] init];
 #endif
 
@@ -684,6 +689,8 @@ bool AudioEngineImpl::init() {
         }
     } while (false);
 
+    // 只有成功初始化后才退休失败观察者；失败析构会把当前观察者切回它。
+    if (ret) clearFailedRebuildHandler(false);
     return ret;
 }
 
@@ -734,7 +741,9 @@ int AudioEngineImpl::play2d(const ccstd::string &filePath, bool loop, float volu
         }
 #endif
 #if CC_PLATFORM == CC_PLATFORM_IOS
-        if (s_AudioEngineSessionHandler.needRebuild || s_AudioEngineSessionHandler.sessionUnavailable) {
+        // 新实例和已知待恢复状态不能被低频检查节流，成功客户端重试也必须通知 JS。
+        if (s_AudioEngineSessionHandler.needReactiveContext || s_AudioEngineSessionHandler.needRebuild ||
+            s_AudioEngineSessionHandler.sessionUnavailable) {
             [s_AudioEngineSessionHandler checkAndRestoreAudioSession:@"play2dPending"];
             if (s_AudioEngineSessionHandler.needRebuild || s_AudioEngineSessionHandler.sessionUnavailable) {
                 return AudioEngine::INVALID_AUDIO_ID;
