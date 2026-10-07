@@ -1,0 +1,62 @@
+diff --git a/sources/enoki/half.h b/sources/enoki/half.h
+index fd2fbb66..80991755 100644
+--- a/sources/enoki/half.h
++++ b/sources/enoki/half.h
+@@ -20,9 +20,25 @@ struct half;
+ NAMESPACE_END(enoki)
+ 
+ NAMESPACE_BEGIN(std)
+-template<> struct is_floating_point<enoki::half> : true_type { };
+-template<> struct is_arithmetic<enoki::half> : true_type { };
+-template<> struct is_signed<enoki::half> : true_type { };
++/*
++ * Xcode 16+/new libc++ marks standard traits like std::is_floating_point,
++ * std::is_arithmetic and std::is_signed as no-specialization entities.
++ * Specializing them here triggers:
++ *   "Users are not allowed to specialize this standard library entity".
++ *
++ * Keep compatibility by only specializing libc++'s internal floating-point
++ * hook for enoki::half. std::is_arithmetic then becomes true through libc++
++ * implementation (is_integral || is_floating_point).
++ *
++ * Keep the original 3 lines below as comments for reference:
++ * template<> struct is_floating_point<enoki::half> : true_type { };
++ * template<> struct is_arithmetic<enoki::half> : true_type { };
++ * template<> struct is_signed<enoki::half> : true_type { };
++ */
++// template<> struct is_floating_point<enoki::half> : true_type { };
++// template<> struct is_arithmetic<enoki::half> : true_type { };
++// template<> struct is_signed<enoki::half> : true_type { };
++template<> struct __libcpp_is_floating_point<enoki::half> : true_type { };
+ NAMESPACE_END(std)
+ 
+ NAMESPACE_BEGIN(enoki)
+diff --git a/sources/xxtea/xxtea.cpp b/sources/xxtea/xxtea.cpp
+index 876a8fa9..d2c9a840 100644
+--- a/sources/xxtea/xxtea.cpp
++++ b/sources/xxtea/xxtea.cpp
+@@ -102,6 +102,10 @@ static unsigned char *xxtea_to_byte_array(xxtea_long *data, xxtea_long len, int
+         n = m;
+     }
+     result = (unsigned char *)malloc(n + 1);
++    if (result == NULL) {
++        *ret_len = 0;
++        return NULL;
++    }
+     for (i = 0; i < n; i++) {
+         result[i] = (unsigned char)((data[i >> 2] >> ((i & 3) << 3)) & 0xff);
+     }
+@@ -163,6 +167,13 @@ unsigned char *xxtea_decrypt(unsigned char *data, xxtea_long data_len, unsigned
+     unsigned char *result;
+     
+     *ret_length = 0;
++
++    // 密文至少包含 1 个数据字 + 1 个长度字（8 字节）。若比这更短（例如文件被截断成 0 字节、
++    // 下载不完整），xxtea_long_decrypt 里 n = len - 1 会下溢成 0xFFFFFFFF 并在 v[n] 处
++    // 越界访问而崩溃。这里直接判为无法解密，调用方已对 NULL 返回值做了报错处理。
++    if (data_len < 8) {
++        return NULL;
++    }
+     
+     if (key_len < 16) {
+         unsigned char *key2 = fix_key_length(key, key_len);
