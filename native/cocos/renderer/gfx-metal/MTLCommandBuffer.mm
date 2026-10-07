@@ -777,6 +777,10 @@ void CCMTLCommandBuffer::copyBuffersToTexture(const uint8_t *const *buffers, Tex
         auto copyFunc = [&](const uint8_t * const buffer, const MTLRegion& mtlRegion, uint32_t size, uint32_t slice, uint8_t depth) {
             if(dstTexture.storageMode != MTLStorageModePrivate || mtlTexture->isPVRTC()) {
                 ccstd::vector<uint8_t> data(size);
+                if (data.data() == nullptr) {
+                    CC_LOG_ERROR("CCMTLCommandBuffer::copyBuffersToTexture: failed to allocate %u bytes of temp data, skip copy", size);
+                    return;
+                }
                 memcpy(data.data(), buffer, size);
 
                 [dstTexture replaceRegion:mtlRegion
@@ -789,6 +793,10 @@ void CCMTLCommandBuffer::copyBuffersToTexture(const uint8_t *const *buffers, Tex
                 CCMTLGPUBuffer stagingBuffer;
                 stagingBuffer.instanceSize = bufferSliceSize;
                 _mtlDevice->gpuStagingBufferPool()->alloc(&stagingBuffer, alignment);
+                if (stagingBuffer.mappedData == nullptr) {
+                    CC_LOG_ERROR("CCMTLCommandBuffer::copyBuffersToTexture: staging buffer alloc failed for %u bytes, skip copy", bufferSliceSize);
+                    return;
+                }
                 memcpy(stagingBuffer.mappedData, buffer, bufferSliceSize);
 
                 CC_ASSERT(stagingBuffer.startOffset % alignment == 0);

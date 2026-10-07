@@ -311,10 +311,24 @@ void doBufferTextureCopy(const uint8_t *const *buffers, Texture *texture, const 
 
     auto *allocator = ccnew ThreadSafeLinearAllocator(totalSize, alignment);
 
-    auto *actorRegions = allocator->allocate<BufferTextureCopy>(count);
-    memcpy(actorRegions, regions, count * sizeof(BufferTextureCopy));
+    // 这里的临时缓冲是"整块纹理数据"量级的，分配失败（内存压力 / 超大纹理）时，
+    // ThreadSafeLinearAllocator 构造函数里的 CC_ASSERT 在 Release 下会被编译掉，
+    // 于是 _buffer 为 null、doAllocate 静默返回 nullptr，后面的 memcpy/memmove 直接写空指针
+    // （线上表现为 SIGSEGV / KERN_INVALID_ADDRESS at 0x0）。必须显式检查并放弃本次拷贝。
+    if (allocator == nullptr || allocator->getBuffer() == nullptr) {
+        CC_LOG_ERROR("doBufferTextureCopy: failed to allocate %u bytes of staging memory, skip copy", static_cast<uint32_t>(totalSize));
+        delete allocator;
+        return;
+    }
 
+    auto *actorRegions = allocator->allocate<BufferTextureCopy>(count);
     const auto **actorBuffers = allocator->allocate<const uint8_t *>(bufferCount);
+    if (actorRegions == nullptr || actorBuffers == nullptr) {
+        CC_LOG_ERROR("doBufferTextureCopy: failed to allocate regions(%u)/buffers(%u), skip copy", count, bufferCount);
+        delete allocator;
+        return;
+    }
+    memcpy(actorRegions, regions, count * sizeof(BufferTextureCopy));
     const auto blockHeight = formatAlignment(format).second;
     for (uint32_t i = 0U, n = 0U; i < count; i++) {
         const BufferTextureCopy &region = regions[i];
@@ -332,6 +346,11 @@ void doBufferTextureCopy(const uint8_t *const *buffers, Texture *texture, const 
 
         for (uint32_t l = 0; l < region.texSubres.layerCount; l++) {
             auto *buffer = allocator->allocate<uint8_t>(size, alignment);
+            if (buffer == nullptr) {
+                CC_LOG_ERROR("doBufferTextureCopy: failed to allocate %u bytes for layer %u/%u, skip copy", size, l, region.texSubres.layerCount);
+                delete allocator;
+                return;
+            }
             uint32_t destOffset = 0;
             uint32_t buffOffset = 0;
             for (uint32_t d = 0; d < depth; d++) {
