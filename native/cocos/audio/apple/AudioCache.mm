@@ -133,6 +133,13 @@ void AudioCache::readDataTask(unsigned int selfId) {
     _readDataTaskMutex.lock();
     _state = State::LOADING;
 
+    // 本函数是"从零重新解码"的加载器（重新 malloc _pcmData、从 seek(0) 开始读），
+    // 但 _framesRead 是跨调用累加的成员变量，此前依赖"每个 AudioCache 只被调度一次"。
+    // 一旦同一个 cache 被再次调度（例如后续音频重建/恢复路径复用 cache），
+    // 第 202/215 行就会用 _pcmData + _framesRead * bytesPerFrame 作为写入偏移而越界，
+    // 造成堆破坏。这里显式归零，使本函数可重复进入且写入始终落在本次分配的缓冲内。
+    _framesRead = 0;
+
     AudioDecoder decoder;
     do {
         if (!decoder.open(_fileFullPath.c_str()))
