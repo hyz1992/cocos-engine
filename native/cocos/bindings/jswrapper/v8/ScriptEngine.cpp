@@ -287,7 +287,13 @@ void ScriptEngine::onFatalErrorCallback(const char *location, const char *messag
 
     SE_LOGE("%s\n", errorStr.c_str());
 
-    getInstance()->callExceptionCallback(location, message, "(no stack information)");
+    // 不能在这里回调 JS：V8 调用 fatal handler 之后必然终止进程，此时 isolate 已不可用，
+    // 执行任何 JS 都可能再次触发 OOM/fatal，把真正的崩溃位置掩盖在嵌套栈里。
+    // 只保留原生回调（它不会进入 V8）。
+    auto *engine = getInstance();
+    if (engine != nullptr && engine->_nativeExceptionCallback) {
+        engine->_nativeExceptionCallback(location, message, "(no stack information)");
+    }
 }
 
 void ScriptEngine::onOOMErrorCallback(const char *location,
@@ -313,7 +319,15 @@ void ScriptEngine::onOOMErrorCallback(const char *location,
 
     errorStr += ", " + message;
     SE_LOGE("%s\n", errorStr.c_str());
-    getInstance()->callExceptionCallback(location, message.c_str(), "(no stack information)");
+
+    // 线上证据（1.6.8 三例，机型为 iPhone16/17 等大内存设备）：这里回调 JS 时 JS 堆已经耗尽，
+    // 一执行 JS 就立刻再次 OOM，crash 栈变成 V8_Fatal ← Invoke ← callExceptionCallback，
+    // 真正的 OOM 位置（Heap::RecomputeLimits）反而被淹没。V8 调用完本回调后必定 abort，
+    // 因此这里只通知原生侧并打日志，让 V8 在真正的 OOM 点干净终止，便于定位。
+    auto *engine = getInstance();
+    if (engine != nullptr && engine->_nativeExceptionCallback) {
+        engine->_nativeExceptionCallback(location, message.c_str(), "(no stack information)");
+    }
 }
 
 void ScriptEngine::onMessageCallback(v8::Local<v8::Message> message, v8::Local<v8::Value> data) {
