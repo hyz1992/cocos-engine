@@ -838,9 +838,41 @@ void AudioEngineImpl::play2dImpl(AudioCache *cache, int audioID) {
         _threadMutex.lock();
         auto playerIt = _audioPlayers.find(audioID);
         if (playerIt != _audioPlayers.end()) {
-            // Trust it, or assert it out.
+            // 不再用 CC_ASSERT(res)：它在 Release 被编掉、在 Debug 直接 abort，
+            // 恰好把"播放其实失败/无声"这条路径藏起来。改为显式判断 + 打日志。
             bool res = playerIt->second->play2d();
-            CC_ASSERT(res);
+            ALuint source = playerIt->second->_alSource;
+            _threadMutex.unlock();
+
+            if (res) {
+                // 诊断：采样 AL_SAMPLE_OFFSET。广告 SDK 切走音频会话后，底层 AudioUnit 可能
+                // 已停止渲染，但所有 AL 调用仍返回成功（"僵尸设备"）—— 此时状态是 PLAYING
+                // 而偏移不前进。0.4 秒后再采一次即可直接判定。
+                ALint state = 0;
+                ALint offset = 0;
+                ALint queued = 0;
+                alGetSourcei(source, AL_SOURCE_STATE, &state);
+                alGetSourcei(source, AL_SAMPLE_OFFSET, &offset);
+                alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
+                ALOGI("[AUDIO_DEBUG] play2dImpl: audioID=%d source=%u state=%d offset=%d queued=%d alErr=0x%x",
+                      audioID, source, state, offset, queued, alGetError());
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    ALint state2 = 0;
+                    ALint offset2 = 0;
+                    alGetSourcei(source, AL_SOURCE_STATE, &state2);
+                    alGetSourcei(source, AL_SAMPLE_OFFSET, &offset2);
+                    if (state2 == AL_PLAYING && offset2 == offset) {
+                        ALOGE("[AUDIO_DEBUG] play2dImpl: STALLED! audioID=%d source=%u state=%d offset stuck at %d (device not rendering)",
+                              audioID, source, state2, offset);
+                    } else {
+                        ALOGI("[AUDIO_DEBUG] play2dImpl: progress ok audioID=%d source=%u state=%d offset %d -> %d",
+                              audioID, source, state2, offset, offset2);
+                    }
+                });
+            } else {
+                ALOGE("[AUDIO_DEBUG] play2dImpl: AudioPlayer::play2d FAILED audioID=%d (no sound)", audioID);
+            }
+            return;
         }
         _threadMutex.unlock();
     } else {
