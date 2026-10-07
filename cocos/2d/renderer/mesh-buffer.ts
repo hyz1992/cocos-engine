@@ -154,6 +154,12 @@ export class MeshBuffer {
         //还得看是否需要共享.buffer
         if (JSB) {
             this._nativeObj.vData = val;
+            // 把容量同步给 native，供其在写入顶点数据前做越界守卫。
+            // 旧 native（未重新生成绑定）没有该方法时静默跳过 —— 此时 native 不做检查，
+            // 行为与改动前完全一致，不会引入新问题。
+            if (typeof this._nativeObj.setVertexCapacity === 'function') {
+                this._nativeObj.setVertexCapacity(val.length);
+            }
         }
     }
 
@@ -170,6 +176,10 @@ export class MeshBuffer {
         this._iData = val;
         if (JSB) {
             this._nativeObj.iData = val;
+            // 同上：同步索引缓冲容量（单位 uint16 个数）
+            if (typeof this._nativeObj.setIndexCapacity === 'function') {
+                this._nativeObj.setIndexCapacity(val.length);
+            }
         }
     }
 

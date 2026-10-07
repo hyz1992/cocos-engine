@@ -52,10 +52,43 @@ CC_FORCE_INLINE void fillIndexBuffers(RenderDrawInfo* drawInfo) { // NOLINT(read
     uint16_t* indexb = drawInfo->getIbBuffer();
     uint32_t indexCount = drawInfo->getIbCount();
 
+    // 索引数据缓冲由 JS 侧分配（ArrayBuffer），容量由 MeshBuffer 同步到 UIMeshBuffer；
+    // 0 表示未知，此时不做检查（与旧行为完全一致）。越界时只报错并跳过本次写入：
+    // 宁可少画一次，也不能把 JS 的 ArrayBuffer 写穿 —— 那破坏的是堆，后续会在完全
+    // 不相干的对象上随机崩溃（线上表现为各种 SDK/V8 回调里的"指针变垃圾"）。
+    const uint32_t indexCapacity = buffer->getIndexCapacity();
+    if (indexCapacity > 0U && static_cast<uint64_t>(indexOffset) + indexCount > indexCapacity) {
+        CC_LOG_ERROR("Batcher2d: index buffer overflow, skip. offset=%u count=%u capacity=%u",
+                     indexOffset, indexCount, indexCapacity);
+        return;
+    }
+
     memcpy(&ib[indexOffset], indexb, indexCount * sizeof(uint16_t));
     indexOffset += indexCount;
 
     buffer->setIndexOffset(indexOffset);
+}
+
+// 顶点数据缓冲（同样由 JS 侧分配）的越界守卫。
+// 容量未知（0）、指针为空、或指针不在该 mesh buffer 的 vData 之内时一律放行，
+// 以保证"拿不到容量信息时行为与旧版完全一致"。
+CC_FORCE_INLINE bool checkVertexWrite(RenderDrawInfo* drawInfo, const float* vbBuffer, uint32_t size) { // NOLINT
+    UIMeshBuffer* buffer = drawInfo->getMeshBuffer();
+    if (buffer == nullptr || vbBuffer == nullptr) {
+        return true;
+    }
+    const uint32_t capacity = buffer->getVertexCapacity();
+    const float* base = buffer->getVData();
+    if (capacity == 0U || base == nullptr || vbBuffer < base) {
+        return true;
+    }
+    const auto offset = static_cast<uint32_t>(vbBuffer - base);
+    if (static_cast<uint64_t>(offset) + size > capacity) {
+        CC_LOG_ERROR("Batcher2d: vertex buffer overflow, skip. offset=%u size=%u capacity=%u",
+                     offset, size, capacity);
+        return false;
+    }
+    return true;
 }
 
 CC_FORCE_INLINE void fillVertexBuffers(RenderEntity* entity, RenderDrawInfo* drawInfo) { // NOLINT(readability-convert-member-functions-to-static)
@@ -64,6 +97,9 @@ CC_FORCE_INLINE void fillVertexBuffers(RenderEntity* entity, RenderDrawInfo* dra
     uint8_t stride = drawInfo->getStride();
     uint32_t size = drawInfo->getVbCount() * stride;
     float* vbBuffer = drawInfo->getVbBuffer();
+    if (!checkVertexWrite(drawInfo, vbBuffer, size)) {
+        return;
+    }
     for (int i = 0; i < size; i += stride) {
         Render2dLayout* curLayout = drawInfo->getRender2dLayout(i);
         // make sure that the layout of Vec3 is three consecutive floats
@@ -87,6 +123,9 @@ CC_FORCE_INLINE void fillColor(RenderEntity* entity, RenderDrawInfo* drawInfo) {
     uint8_t stride = drawInfo->getStride();
     uint32_t size = drawInfo->getVbCount() * stride;
     float* vbBuffer = drawInfo->getVbBuffer();
+    if (!checkVertexWrite(drawInfo, vbBuffer, size)) {
+        return;
+    }
     Color temp = entity->getColor();
 
     uint32_t offset = 0;

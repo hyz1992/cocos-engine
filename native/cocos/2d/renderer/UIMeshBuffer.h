@@ -49,6 +49,16 @@ public:
     inline uint16_t* getIData() const { return _iData; }
     void setIData(uint16_t* iData);
 
+    // 2D 合批的顶点/索引数据缓冲由 JS 侧分配（ArrayBuffer），native 侧只持有裸指针，
+    // 因此 native 无从得知容量。这里把容量同步过来，供写入前做越界守卫：
+    //   vertexCapacity 单位是 float 个数（Float32Array.length）
+    //   indexCapacity  单位是 uint16 个数（Uint16Array.length）
+    // 0 表示未知 —— 此时不做检查，与旧行为完全一致。
+    void setVertexCapacity(uint32_t capacity);
+    void setIndexCapacity(uint32_t capacity);
+    inline uint32_t getVertexCapacity() const { return _initVDataCount; }
+    inline uint32_t getIndexCapacity() const { return _initIDataCount; }
+
     void initialize(ccstd::vector<gfx::Attribute>&& attrs, bool needCreateLayout = false);
     void reset();
     void destroy();
