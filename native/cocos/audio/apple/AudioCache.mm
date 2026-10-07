@@ -338,7 +338,19 @@ void AudioCache::invokingLoadCallbacks() {
     }
 
     auto isDestroyed = _isDestroyed;
+    // 应用/引擎已经销毁时（例如退出过程中音频解码线程仍在跑），CC_CURRENT_ENGINE() 会
+    // 解引用空的 Application 直接崩溃（SIGSEGV at 0x0，且发生在 dyld 之外的解码线程上）。
+    // 这里先持有 Application 的 shared_ptr 再判空，避免把它传下去。
+    auto application = CC_CURRENT_APPLICATION_SAFE();
+    if (application == nullptr) {
+        ALOGV("AudioCache (%p) no current application, don't invoke preload callback ...", this);
+        return;
+    }
     auto scheduler = CC_CURRENT_ENGINE()->getScheduler();
+    if (scheduler == nullptr) {
+        ALOGV("AudioCache (%p) no scheduler, don't invoke preload callback ...", this);
+        return;
+    }
     scheduler->performFunctionInCocosThread([&, isDestroyed]() {
         if (*isDestroyed) {
             ALOGV("invokingLoadCallbacks perform in cocos thread, AudioCache (%p) was destroyed!", this);

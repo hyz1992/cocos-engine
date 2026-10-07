@@ -683,9 +683,16 @@ bool AudioEngineImpl::init() {
 
             // ================ Workaround end ================ //
 
-            _scheduler = CC_CURRENT_ENGINE()->getScheduler();
-            ret = true;
-            ALOGI("OpenAL was initialized successfully!");
+            // 引擎/应用可能已经处于销毁过程中，此时 CC_CURRENT_ENGINE() 会解引用空的
+            // Application 直接崩溃（SIGSEGV at 0x0）。判空并按初始化失败处理，避免把
+            // 空的 _scheduler 留给后续回调使用。
+            if (CC_CURRENT_APPLICATION_SAFE() == nullptr) {
+                ALOGI("AudioEngineImpl::init: no current application, abort OpenAL init.");
+            } else {
+                _scheduler = CC_CURRENT_ENGINE()->getScheduler();
+                ret = true;
+                ALOGI("OpenAL was initialized successfully!");
+            }
         }
     } while (false);
 
