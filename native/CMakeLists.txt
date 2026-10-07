@@ -255,6 +255,23 @@ endif()
 
 include(${EXTERNAL_ROOT}/CMakeLists.txt)
 
+# external 里由源码编译的目标（boost_container 等）默认不带部署目标，Xcode 会让它们
+# 回落到 SDK 版本（例如 iOS 26.4）。min-OS 落到 26 会让 clang 抬高 arm64 基线并生成
+# ldaprb 等 ARMv8.3-RCpc 指令，在 A11 及更早机型上会在启动阶段（dyld 静态初始化）
+# 直接 SIGILL。这里统一对齐引擎目标的部署目标，避免编出设备不支持的指令。
+if(APPLE AND DEFINED TARGET_IOS_VERSION)
+    foreach(_cc_external_lib ${CC_EXTERNAL_LIBS})
+        if(TARGET ${_cc_external_lib})
+            get_target_property(_cc_external_lib_imported ${_cc_external_lib} IMPORTED)
+            if(NOT _cc_external_lib_imported)
+                set_property(TARGET ${_cc_external_lib} PROPERTY XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET ${TARGET_IOS_VERSION})
+            endif()
+        endif()
+    endforeach()
+    unset(_cc_external_lib)
+    unset(_cc_external_lib_imported)
+endif()
+
 ##### audio
 if(USE_AUDIO)
     cocos_source_files(
