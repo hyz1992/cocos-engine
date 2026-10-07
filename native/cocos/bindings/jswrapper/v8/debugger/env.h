@@ -389,7 +389,7 @@ public:
     };
 
 private:
-    inline void ThrowError(v8::Local<v8::Value> (*fun)(v8::Local<v8::String>, v8::Local<v8::Value>),
+    inline void ThrowError(v8::Local<v8::Value> (*fun)(v8::Local<v8::String>),
                            const char *errmsg);
 
     v8::Isolate *const isolate_;
@@ -533,10 +533,10 @@ inline void Environment::ThrowRangeError(const char *errmsg) {
 }
 
 inline void Environment::ThrowError(
-    v8::Local<v8::Value> (*fun)(v8::Local<v8::String>, v8::Local<v8::Value> options),
+    v8::Local<v8::Value> (*fun)(v8::Local<v8::String>),
     const char *errmsg) {
     v8::HandleScope handle_scope(isolate());
-    isolate()->ThrowException(fun(OneByteString(isolate(), errmsg, strlen(errmsg)), {}));
+    isolate()->ThrowException(fun(OneByteString(isolate(), errmsg)));
 }
 
 inline void Environment::ThrowErrnoException(int errorno,
