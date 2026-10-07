@@ -170,7 +170,7 @@ static bool bkCategoryIsForRecording(NSString *category) {
  */
 static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
     if (s_ALDevice == nullptr || s_ALContext == nullptr) {
-        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): skip, OpenAL is not initialized", reason);
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): skip, OpenAL is not initialized", reason);
         // 引擎尚未初始化（甚至还没被使用过）时不需要重建
         return BKAudioRestoreResult::Ready;
     }
@@ -183,12 +183,12 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
     //    这种情况下只做激活和上下文重挂，类别收尾交给录音模块自己
     NSString *categoryBefore = audioSession.category;
     if (bkCategoryIsForRecording(categoryBefore)) {
-        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): category \"%s\" is for recording, keep it and only reactivate",
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): category \"%s\" is for recording, keep it and only reactivate",
               reason, categoryBefore.UTF8String);
     } else if (![categoryBefore isEqualToString:AVAudioSessionCategoryAmbient]) {
         error = nil;
         BOOL success = [audioSession setCategory:AVAudioSessionCategoryAmbient error:&error];
-        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): category \"%s\" -> Ambient, success=%d, error=%s",
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): category \"%s\" -> Ambient, success=%d, error=%s",
               reason, categoryBefore.UTF8String, (int)success, error ? error.description.UTF8String : "nil");
         if (!success) return BKAudioRestoreResult::SessionUnavailable;
     }
@@ -198,22 +198,22 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
     BOOL active = [audioSession setActive:YES error:&error];
     // outputVolume 一并打出来：万一是广告SDK把系统音量改成了0（有些SDK为了强推广告音量会这么干），
     // 这行日志能直接看出来，避免继续在会话/上下文上排查
-    ALOGI("[AUDIO_DEBUG] AudioRestore(%s): setActive YES, success=%d, error=%s, category=%s, outputVolume=%.2f, otherAudioPlaying=%d",
+    ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): setActive YES, success=%d, error=%s, category=%s, outputVolume=%.2f, otherAudioPlaying=%d",
           reason, (int)active, error ? error.description.UTF8String : "nil",
           audioSession.category.UTF8String, audioSession.outputVolume, (int)audioSession.isOtherAudioPlaying);
     if (!active) return BKAudioRestoreResult::SessionUnavailable;
 
     // 3. 重新挂上 OpenAL 上下文：上下文被摘掉后即使不报错也不会出声，必须重新挂上
     if (alcGetCurrentContext() == s_ALContext) {
-        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): OpenAL context is current", reason);
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): OpenAL context is current", reason);
         return BKAudioRestoreResult::Ready;
     }
     if (alcMakeContextCurrent(s_ALContext)) {
-        ALOGI("[AUDIO_DEBUG] AudioRestore(%s): OpenAL context re-activated", reason);
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): OpenAL context re-activated", reason);
         return BKAudioRestoreResult::Ready;
     }
 
-    ALOGE("[AUDIO_DEBUG] AudioRestore(%s): alcMakeContextCurrent FAILED", reason);
+    ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): alcMakeContextCurrent FAILED", reason);
     return BKAudioRestoreResult::ContextUnavailable;
 }
 
@@ -290,6 +290,11 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
 - (void)restoreAudioSession:(NSString *)reason {
     if (![self handleOnMainThread:_cmd object:reason]) return;
     if (![self canRestoreAudioSession]) {
+        ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] restore(%s) SKIPPED: mainThread=%d isHandler=%d appActive=%d adShowing=%d interrupted=%d recordingCategory=%d",
+              reason.UTF8String, (int)[NSThread isMainThread], (int)(self == s_AudioEngineSessionHandler),
+              (int)([UIApplication sharedApplication].applicationState == UIApplicationStateActive),
+              (int)self.adShowing, (int)self.interrupted,
+              (int)bkCategoryIsForRecording([AVAudioSession sharedInstance].category));
         self.needReactiveContext = true;
         return;
     }
@@ -362,7 +367,7 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
         self.rebuildScheduled = false;
         if (self != s_AudioEngineSessionHandler || generation != self.restoreGeneration ||
             ![self canRestoreAudioSession]) return;
-        ALOGW("[AUDIO_DEBUG] AudioRebuild(%s): end() + lazyInit()", reason.UTF8String);
+        ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRebuild(%s): end() + lazyInit()", reason.UTF8String);
         bkNotifyAudioJS("onAudioEngineWillReset");
         // JS 中断事件可能同步打开广告/切后台，不能在重入后继续销毁会话。
         if (self != s_AudioEngineSessionHandler || generation != self.restoreGeneration ||
@@ -389,7 +394,7 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
                 });
             }
         }
-        ALOGW("[AUDIO_DEBUG] AudioRebuild: result=%d, previous players dropped", (int)success);
+        ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRebuild: result=%d, previous players dropped", (int)success);
     });
 }
 
@@ -402,6 +407,10 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
 
 - (void)resumeAudio:(NSNotification *)notification {
     if (![self handleOnMainThread:_cmd object:notification]) return;
+    ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] resumeAudio: name=%s appState=%ld interrupted=%d adShowing=%d needReactive=%d needRebuild=%d category=%s",
+          notification.name.UTF8String, (long)[UIApplication sharedApplication].applicationState, (int)self.interrupted,
+          (int)self.adShowing, (int)self.needReactiveContext, (int)self.needRebuild,
+          [AVAudioSession sharedInstance].category.UTF8String);
     // 系统不保证每次 Began 都有 Ended。真正回到 active 前台也是一次恢复机会。
     if ([notification.name isEqualToString:UIApplicationDidBecomeActiveNotification] &&
         [UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
@@ -415,6 +424,8 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
 
 - (void)handleAppInactive:(NSNotification *)notification {
     if (![self handleOnMainThread:_cmd object:notification]) return;
+    ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] handleAppInactive: appState=%ld adShowing=%d",
+          (long)[UIApplication sharedApplication].applicationState, (int)self.adShowing);
     ++self.restoreGeneration;
     self.needReactiveContext = true;
     bkNotifyAudioJS("onAudioSessionSuspended");
@@ -424,12 +435,14 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
     if (![self handleOnMainThread:_cmd object:notification]) return;
     NSInteger reason = [[[notification userInfo] objectForKey:AVAudioSessionInterruptionTypeKey] integerValue];
     if (reason == AVAudioSessionInterruptionTypeBegan) {
+        ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] interruption BEGAN");
         ++self.restoreGeneration;
         self.interrupted = true;
         self.needReactiveContext = true;
         bkNotifyAudioJS("onAudioSessionSuspended");
         alcMakeContextCurrent(nullptr);
     } else if (reason == AVAudioSessionInterruptionTypeEnded) {
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] interruption ENDED");
         self.interrupted = false;
         [self scheduleRestoreAudioSession:@"interruptionEnded"];
     }
@@ -456,16 +469,16 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
         self.adShowing = true;
         bkNotifyAudioJS("onAudioSessionSuspended");
         self.adStartTime = [[NSDate date] timeIntervalSince1970];
-        ALOGI("[AUDIO_DEBUG] AudioAd: start, cancel previous recovery tasks");
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioAd: start, cancel previous recovery tasks");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(BK_AD_SHOWING_SAFETY_TIMEOUT * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (self != s_AudioEngineSessionHandler || adGeneration != self.adGeneration || !self.adShowing) return;
-            ALOGW("[AUDIO_DEBUG] AudioAd: missing close callback after 120s");
+            ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] AudioAd: missing close callback after 120s");
             self.adShowing = false;
             self.adStartTime = 0;
             [self scheduleRestoreAudioSession:@"adNoCloseCallback"];
         });
     } else if ([state isEqualToString:@"close"]) {
-        ALOGI("[AUDIO_DEBUG] AudioAd: close, restoring audio session");
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioAd: close, restoring audio session");
         ++self.adGeneration;
         self.adShowing = false;
         self.adStartTime = 0;
@@ -475,6 +488,7 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
 
 - (void)handleMediaServicesWereReset:(NSNotification *)notification {
     if (![self handleOnMainThread:_cmd object:notification]) return;
+    ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] mediaServicesWereReset");
     ++self.restoreGeneration;
     self.interrupted = false;
     [self rebuildAudioEngine:@"mediaServicesReset"];
@@ -482,6 +496,8 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
 
 - (void)handleRouteChange:(NSNotification *)notification {
     if (![self handleOnMainThread:_cmd object:notification]) return;
+    ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] routeChange: category=%s",
+          [AVAudioSession sharedInstance].category.UTF8String);
     [self checkAndRestoreAudioSession:@"routeChange"];
 }
 
@@ -854,7 +870,7 @@ void AudioEngineImpl::play2dImpl(AudioCache *cache, int audioID) {
                 alGetSourcei(source, AL_SOURCE_STATE, &state);
                 alGetSourcei(source, AL_SAMPLE_OFFSET, &offset);
                 alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
-                ALOGI("[AUDIO_DEBUG] play2dImpl: audioID=%d source=%u state=%d offset=%d queued=%d alErr=0x%x",
+                ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: audioID=%d source=%u state=%d offset=%d queued=%d alErr=0x%x",
                       audioID, source, state, offset, queued, alGetError());
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     ALint state2 = 0;
@@ -862,22 +878,23 @@ void AudioEngineImpl::play2dImpl(AudioCache *cache, int audioID) {
                     alGetSourcei(source, AL_SOURCE_STATE, &state2);
                     alGetSourcei(source, AL_SAMPLE_OFFSET, &offset2);
                     if (state2 == AL_PLAYING && offset2 == offset) {
-                        ALOGE("[AUDIO_DEBUG] play2dImpl: STALLED! audioID=%d source=%u state=%d offset stuck at %d (device not rendering)",
+                        ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: STALLED! audioID=%d source=%u state=%d offset stuck at %d (device not rendering)",
                               audioID, source, state2, offset);
                     } else {
                         // 正常推进用 D 级：避免每次播放都刷屏；只有异常（STALLED）才用 E 级。
-                        ALOGD("[AUDIO_DEBUG] play2dImpl: progress ok audioID=%d source=%u state=%d offset %d -> %d",
+                        ALOGD("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: progress ok audioID=%d source=%u state=%d offset %d -> %d",
                               audioID, source, state2, offset, offset2);
                     }
                 });
             } else {
-                ALOGE("[AUDIO_DEBUG] play2dImpl: AudioPlayer::play2d FAILED audioID=%d (no sound)", audioID);
+                ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: AudioPlayer::play2d FAILED audioID=%d (no sound)", audioID);
             }
             return;
         }
         _threadMutex.unlock();
     } else {
-        ALOGD("AudioEngineImpl::play2dImpl, cache was destroyed or not ready!");
+        ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: cache NOT READY (destroyed=%d state=%d) audioID=%d",
+              (int)*cache->_isDestroyed, (int)cache->_state, audioID);
         auto iter = _audioPlayers.find(audioID);
         if (iter != _audioPlayers.end()) {
             iter->second->_removeByAudioEngine = true;
