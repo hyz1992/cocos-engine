@@ -1,3 +1,22 @@
+diff --git a/sources/boost-source/container/CMakeLists.txt b/sources/boost-source/container/CMakeLists.txt
+index ec77ce36..0d11d1d4 100644
+--- a/sources/boost-source/container/CMakeLists.txt
++++ b/sources/boost-source/container/CMakeLists.txt
+@@ -38,4 +38,14 @@ if(APPLE)
+   set_target_properties(boost_container PROPERTIES
+     ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/archives
+   )
++  # 必须显式指定部署目标：否则 Xcode 会回落到 SDK 版本（例如 iOS 26.4），
++  # clang 会据此抬高 arm64 基线，把本库里的 acquire 字节读编成 ldaprb 等
++  # ARMv8.3-RCpc 指令；A11 及更早的 CPU 不支持，而这些全局初始化在 dyld
++  # 静态初始化阶段就会执行 → 一启动就 SIGILL。
++  # TARGET_IOS_VERSION 由工程侧以 CACHE 变量提供（cfg.cmake / common/CMakeLists.txt）。
++  if(DEFINED TARGET_IOS_VERSION)
++    set_target_properties(boost_container PROPERTIES
++      XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET ${TARGET_IOS_VERSION}
++    )
++  endif()
+ endif()
 diff --git a/sources/enoki/half.h b/sources/enoki/half.h
 index fd2fbb66..80991755 100644
 --- a/sources/enoki/half.h
