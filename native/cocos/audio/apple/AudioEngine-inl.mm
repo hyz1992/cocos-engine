@@ -865,7 +865,8 @@ void AudioEngineImpl::play2dImpl(AudioCache *cache, int audioID) {
                         ALOGE("[AUDIO_DEBUG] play2dImpl: STALLED! audioID=%d source=%u state=%d offset stuck at %d (device not rendering)",
                               audioID, source, state2, offset);
                     } else {
-                        ALOGI("[AUDIO_DEBUG] play2dImpl: progress ok audioID=%d source=%u state=%d offset %d -> %d",
+                        // 正常推进用 D 级：避免每次播放都刷屏；只有异常（STALLED）才用 E 级。
+                        ALOGD("[AUDIO_DEBUG] play2dImpl: progress ok audioID=%d source=%u state=%d offset %d -> %d",
                               audioID, source, state2, offset, offset2);
                     }
                 });
