@@ -1137,17 +1137,87 @@ void ScriptEngine::reportException(v8::Isolate *isolate, v8::Local<v8::Message> 
             // Print line of source code.
             v8::String::Utf8Value const sourcelinevalue(isolate, sourceline);
             const char *sourcelineString = toCString(sourcelinevalue);
-            ss << sourcelineString << '\n';
-            // Print wavy underline (GetUnderline is deprecated).
             int const start = message->GetStartColumn(context).FromJust();
+            int const end = message->GetEndColumn(context).FromJust();
+
+            // 压缩后的 bundle 常常整包只有一行：V8 的 GetSourceLine() 会把整包（几十万字符）
+            // 返回，再叠加按列号打印的空格/^ 下划线，单次 JS 报错就能产生数百 KB 的同步日志，
+            // 线上表现为"一个小 JS 错误把主线程拖死、点击无响应"。
+            // 这里在发布行为下只保留出错位置附近的窗口；需要完整源码时把
+            // CC_JS_EXCEPTION_FULL_SOURCE 置 1 重新编译即可（诊断能力本身不受影响：
+            // message 与完整 stack 照旧，回调与上报链路完全不变）。
+#ifndef CC_JS_EXCEPTION_FULL_SOURCE
+    #define CC_JS_EXCEPTION_FULL_SOURCE 0
+#endif
+#if CC_JS_EXCEPTION_FULL_SOURCE
+            ss << sourcelineString << '\n';
             for (int i = 0; i < start; i++) {
                 ss << ' ';
             }
-            int const end = message->GetEndColumn(context).FromJust();
             for (int i = start; i < end; i++) {
                 ss << '^';
             }
             ss << '\n';
+#else
+            const ccstd::string source(sourcelineString);
+            const size_t maxContext = 200; // 出错位置前后各保留的字符数
+            if (source.size() <= maxContext * 2) {
+                // 非压缩代码（手写 TS / 开发构建）永远走这里，输出与改动前逐字节一致
+                ss << source << '\n';
+                for (int i = 0; i < start; i++) {
+                    ss << ' ';
+                }
+                for (int i = start; i < end; i++) {
+                    ss << '^';
+                }
+                ss << '\n';
+            } else {
+                const size_t startPos = (start > 0) ? static_cast<size_t>(start) : 0;
+                const size_t endPos = (end > 0) ? static_cast<size_t>(end) : 0;
+                // 按 UTF-8 字符边界取窗口，避免切断多字节字符（否则日志/上报里会出现非法 UTF-8）
+                auto isContinuationByte = [](unsigned char c) { return (c & 0xC0U) == 0x80U; };
+                size_t winFrom = (startPos > maxContext) ? (startPos - maxContext) : 0;
+                while (winFrom > 0 && winFrom < source.size() &&
+                       isContinuationByte(static_cast<unsigned char>(source[winFrom]))) {
+                    --winFrom;
+                }
+                size_t winTo = startPos + maxContext;
+                if (winTo > source.size()) {
+                    winTo = source.size();
+                }
+                while (winTo < source.size() &&
+                       isContinuationByte(static_cast<unsigned char>(source[winTo]))) {
+                    ++winTo;
+                }
+
+                if (winFrom > 0) {
+                    ss << "...";
+                }
+                ss << source.substr(winFrom, winTo - winFrom);
+                if (winTo < source.size()) {
+                    ss << "...";
+                }
+                ss << "[源码行已截断：原长 " << source.size() << " 字符，本处显示 " << winFrom << "-" << winTo << "]" << '\n';
+
+                // 下划线裁剪到窗口内（否则会按列号打印几十万个空格）
+                const size_t winLen = winTo - winFrom;
+                size_t caretStart = (startPos > winFrom) ? (startPos - winFrom) : 0;
+                size_t caretEnd = (endPos > winFrom) ? (endPos - winFrom) : 0;
+                if (caretStart > winLen) {
+                    caretStart = winLen;
+                }
+                if (caretEnd > winLen) {
+                    caretEnd = winLen;
+                }
+                for (size_t i = 0; i < caretStart; i++) {
+                    ss << ' ';
+                }
+                for (size_t i = caretStart; i < caretEnd; i++) {
+                    ss << '^';
+                }
+                ss << '\n';
+            }
+#endif
         }
 
         location = ss.str();
