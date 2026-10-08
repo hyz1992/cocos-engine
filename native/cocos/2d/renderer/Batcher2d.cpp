@@ -56,9 +56,12 @@ CC_FORCE_INLINE void fillIndexBuffers(RenderDrawInfo* drawInfo) { // NOLINT(read
     // 0 表示未知，此时不做检查（与旧行为完全一致）。越界时只报错并跳过本次写入：
     // 写穿 JS 的 ArrayBuffer 破坏的是堆，后续会在完全不相干的对象上随机崩溃
     // （线上表现为各种 SDK/V8 回调里的"指针变垃圾"），两害相权取其轻。
-    // 注意：本函数只负责"不写越界"，不会阻止调用方继续提交这条 draw info ——
-    // 触发后该区间可能仍是未写入/被别的 draw info 复用的数据，即**可能出现绘制错乱**，
-    // 而不是"少画一次"。要彻底避免需要在上层跳过提交（改动面更大，需真机验证，故未做）。
+    // 注意（触发后的真实行为，已由 Tools/ios_batcher_guard_test.sh 抽本函数真实函数体 +
+    // canary 桩验证，不是推测）：这里不推进 buffer 的 indexOffset，而上层 generateBatch 是按
+    //   indexCount = currMeshBuffer->getIndexOffset() - _indexStart
+    // 推算覆盖区间的，所以这条 draw info 最终拿到的恰好是 0 个索引 —— **这一帧不画它**，
+    // 既不会拿未写入/被复用的数据去画，也不会影响别的 draw info 的区间；代价只是本帧少一个
+    // 元素。（早先自审里写的"可能绘制错乱"经核实是错的。）
     const uint32_t indexCapacity = buffer->getIndexCapacity();
     if (indexCapacity > 0U && static_cast<uint64_t>(indexOffset) + indexCount > indexCapacity) {
         // 日志限频：容量不一致会每帧、每条 draw info 触发一次；线上有过"日志把主线程拖死"的教训
@@ -80,6 +83,15 @@ CC_FORCE_INLINE void fillIndexBuffers(RenderDrawInfo* drawInfo) { // NOLINT(read
 // 顶点数据缓冲（同样由 JS 侧分配）的越界守卫。
 // 容量未知（0）、指针为空、或指针不在该 mesh buffer 的 vData 之内时一律放行，
 // 以保证"拿不到容量信息时行为与旧版完全一致"。
+//
+// 触发后的真实行为（已登记的限制）：写入被跳过，但**这条 draw info 仍会被提交**，
+// 画出来的是它上一帧的顶点（fillVertexBuffers）或颜色（fillColor）—— 即"元素位置/颜色停在
+// 上一帧"，而不是随机脏数据（chunk 的顶点区是按 draw info 分配的、每帧就地变换）。
+// 不在这里阻止提交，是因为"跳过提交"必须动 generateBatch 的提交路径，而且还得保留
+// _indexStart/_currMeshBuffer 的推进；一旦标志位泄漏，元素会**永久消失** ——
+// 风险大于收益（触发前提本就是 JS 侧容量算错，此时"停一帧"已远好于破坏堆）。
+// 若将来真要改成"整条 draw info 不提交"，必须真机验证以下三种场景：
+//   大厅(Label/Spine) / 老虎机(大量 Sprite 动画) / 羊了个羊(频繁增删节点)，确认不出现元素消失。
 CC_FORCE_INLINE bool checkVertexWrite(RenderDrawInfo* drawInfo, const float* vbBuffer, uint32_t size) { // NOLINT
     UIMeshBuffer* buffer = drawInfo->getMeshBuffer();
     if (buffer == nullptr || vbBuffer == nullptr) {
