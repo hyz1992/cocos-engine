@@ -163,6 +163,33 @@ static bool bkCategoryIsForRecording(NSString *category) {
 }
 
 /**
+ 把 OpenAL 上下文"摘掉再挂回"，强制重绑。
+
+ 为什么必须显式重绑（这是"看完广告没声音"的正式修复）：
+   `alcGetCurrentContext() == s_ALContext` 只说明**上下文还挂着**，**不代表底层 AudioUnit 还在渲染**。
+   广告 SDK 抢走 AVAudioSession 时 iOS 会停掉 AudioUnit；会话恢复后 Apple 的 OpenAL 不一定会
+   把它重新启动 —— 此时所有 AL 调用都返回成功、source 状态是 AL_PLAYING，但采样偏移永远停在 0
+   （线上 26.7.1 实测：激励视频结束后大厅/老虎机全部音效都命中 play2dImpl 的 "STALLED"，
+   而日志里 AudioRestore(adClose) 明确写着 "OpenAL context is current"；
+   切后台再回前台能恢复，走的正是 resume() 里那条"上下文不匹配 → alcMakeContextCurrent"的路径）。
+   所以这里无论是否 current 都重绑一次，让 OpenAL 重新启动 AudioUnit。
+ */
+static bool bkRebindOpenALContext(const char *reason) {
+    if (s_ALDevice == nullptr || s_ALContext == nullptr) {
+        ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] Rebind(%s): skip, OpenAL is not initialized", reason);
+        return false;
+    }
+    // 先摘掉再挂回：只有"先摘"才能让 OpenAL 真正重新绑定（对已经正常的场景无害）
+    alcMakeContextCurrent(nullptr);
+    if (alcMakeContextCurrent(s_ALContext)) {
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] Rebind(%s): OpenAL context re-bound (restart AudioUnit)", reason);
+        return true;
+    }
+    ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] Rebind(%s): alcMakeContextCurrent FAILED", reason);
+    return false;
+}
+
+/**
  把 AVAudioSession 拉回游戏期望的状态，并把 OpenAL 上下文重新挂上。
  广告SDK/录音等模块切走 session 后往往不会还原，这里统一做修复。
  只依赖文件级静态变量，所以音频引擎重建之后也能直接调用。
@@ -203,18 +230,19 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
           audioSession.category.UTF8String, audioSession.outputVolume, (int)audioSession.isOtherAudioPlaying);
     if (!active) return BKAudioRestoreResult::SessionUnavailable;
 
-    // 3. 重新挂上 OpenAL 上下文：上下文被摘掉后即使不报错也不会出声，必须重新挂上
+    // 3. 重新挂上 OpenAL 上下文，并**强制重绑一次**。
+    //    "上下文已经是 current"并不等于设备还在渲染（详见 bkRebindOpenALContext 的说明）：
+    //    广告结束后 AudioUnit 可能已被 iOS 停掉，而上下文还挂着 —— 只判断 current 就会漏掉这个状态，
+    //    结果所有 AL 调用都成功但永远不出声。所以这里不再提前 return，统一走重绑。
     if (alcGetCurrentContext() == s_ALContext) {
-        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): OpenAL context is current", reason);
-        return BKAudioRestoreResult::Ready;
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): OpenAL context is current, rebind anyway to restart AudioUnit", reason);
+    } else {
+        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): OpenAL context mismatch, re-binding", reason);
     }
-    if (alcMakeContextCurrent(s_ALContext)) {
-        ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): OpenAL context re-activated", reason);
-        return BKAudioRestoreResult::Ready;
+    if (!bkRebindOpenALContext(reason)) {
+        return BKAudioRestoreResult::ContextUnavailable;
     }
-
-    ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): alcMakeContextCurrent FAILED", reason);
-    return BKAudioRestoreResult::ContextUnavailable;
+    return BKAudioRestoreResult::Ready;
 }
 
 @implementation AudioEngineSessionHandler
@@ -887,6 +915,26 @@ void AudioEngineImpl::play2dImpl(AudioCache *cache, int audioID) {
                     if (state2 == AL_PLAYING && offset2 == offset) {
                         ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: STALLED! audioID=%d source=%u state=%d offset stuck at %d (device not rendering)",
                               audioID, source, state2, offset);
+                        // 自愈兜底：偏移不动 = 底层 AudioUnit 没在渲染。重绑一次上下文让 OpenAL 重启它，
+                        // 0.4 秒后再复查一次，把"是否真的救回来"写进日志（便于线上/测试直接判读）。
+                        // 限频 5 秒：避免播放密集时反复重绑。
+                        static NSTimeInterval s_lastStalledRecover = 0;
+                        NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
+                        if (nowTs - s_lastStalledRecover >= 5.0) {
+                            s_lastStalledRecover = nowTs;
+                            bkRebindOpenALContext("stalled");
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                                ALint state3 = 0;
+                                ALint offset3 = 0;
+                                alGetSourcei(source, AL_SOURCE_STATE, &state3);
+                                alGetSourcei(source, AL_SAMPLE_OFFSET, &offset3);
+                                if (state3 == AL_PLAYING && offset3 == offset) {
+                                    ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: StalledRecover FAILED, still stuck at %d (audioID=%d)", offset3, audioID);
+                                } else {
+                                    ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: StalledRecover OK, offset %d -> %d (audioID=%d)", offset, offset3, audioID);
+                                }
+                            });
+                        }
                     } else {
                         // 正常推进用 D 级：避免每次播放都刷屏；只有异常（STALLED）才用 E 级。
                         ALOGD("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: progress ok audioID=%d source=%u state=%d offset %d -> %d",
