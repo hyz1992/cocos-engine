@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <iostream>
 #include "platform/interfaces/modules/ISystemWindow.h"
 
@@ -57,6 +58,9 @@ private:
     UIWindow* _window{nullptr};
     // Cached CAMetalLayer of the game view, resolved on the main thread. Read by the
     // render thread through getWindowLayer(): UIKit must never be touched from there.
-    mutable uintptr_t _windowLayer{0};
+    // Written on the main thread and read on the render thread without a common lock,
+    // so it is an atomic (relaxed is enough: the swapchain creation that consumes the
+    // value is ordered by the gfx command queue, not by this variable).
+    mutable std::atomic<uintptr_t> _windowLayer{0};
 };
 } // namespace cc

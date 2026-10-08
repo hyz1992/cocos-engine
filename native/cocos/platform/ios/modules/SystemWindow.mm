@@ -64,7 +64,7 @@ uintptr_t SystemWindow::getWindowLayer() const {
     if ([NSThread isMainThread]) {
         UIView *view = UIApplication.sharedApplication.delegate.window.rootViewController.view;
         if (view) {
-            _windowLayer = reinterpret_cast<uintptr_t>(view.layer);
+            _windowLayer.store(reinterpret_cast<uintptr_t>(view.layer), std::memory_order_relaxed);
 
             // A1 第二轮（真机日志驱动）：不仅"取 layer"要在主线程，**改 layer 的属性**也不能在
             // 渲染线程做 —— 对"由 view 支持的 layer"，UIKit 会拦截属性修改并在非主线程时报：
@@ -85,7 +85,7 @@ uintptr_t SystemWindow::getWindowLayer() const {
             }
         }
     }
-    return _windowLayer;
+    return _windowLayer.load(std::memory_order_relaxed);
 }
 
 SystemWindow::Size SystemWindow::getViewSize() const {

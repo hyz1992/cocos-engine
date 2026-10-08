@@ -179,7 +179,10 @@ static bool bkRebindOpenALContext(const char *reason) {
         ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] Rebind(%s): skip, OpenAL is not initialized", reason);
         return false;
     }
-    // 先摘掉再挂回：只有"先摘"才能让 OpenAL 真正重新绑定（对已经正常的场景无害）
+    // 先摘掉再挂回：只有"先摘"才能让 OpenAL 真正重新绑定。
+    // 注意：重绑会**停掉所有正在播放的源**（循环源由补数据线程的自愈重播救回，
+    // 非循环短音效会被直接掐断）—— 它不是无害操作，只应在"确知会话刚被接管/疑似僵尸设备"
+    // 的恢复路径上调用，不要当作日常手段扩大使用面。
     alcMakeContextCurrent(nullptr);
     if (alcMakeContextCurrent(s_ALContext)) {
         ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] Rebind(%s): OpenAL context re-bound (restart AudioUnit)", reason);
@@ -264,6 +267,10 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
     //    "上下文已经是 current"并不等于设备还在渲染（详见 bkRebindOpenALContext 的说明）：
     //    广告结束后 AudioUnit 可能已被 iOS 停掉，而上下文还挂着 —— 只判断 current 就会漏掉这个状态，
     //    结果所有 AL 调用都成功但永远不出声。所以这里不再提前 return，统一走重绑。
+    //    【登记在案的代价】重绑会停掉所有正在播放的源，而本函数挂在 routeChange（插拔耳机等
+    //    常规事件）上也会走到这里 —— 正在播的非循环短音效会被掐断（循环 BGM 由补数据线程的
+    //    自愈重播救回）。这是"广告后无声必须重绑"换来的可接受取舍；若将来要优化，方向是
+    //    把 routeChange 与 adClose 的恢复路径区分对待，而不是去掉这里的重绑。
     if (alcGetCurrentContext() == s_ALContext) {
         ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] AudioRestore(%s): OpenAL context is current, rebind anyway to restart AudioUnit", reason);
     } else {
@@ -951,6 +958,13 @@ void AudioEngineImpl::play2dImpl(AudioCache *cache, int audioID) {
                 alGetSourcei(source, AL_BUFFERS_QUEUED, &queued);
                 ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: audioID=%d source=%u state=%d offset=%d queued=%d alErr=0x%x",
                       audioID, source, state, offset, queued, alGetError());
+                // 延迟 block **不能捕获 cache 裸指针**：AudioCache 按值存在 _audioCaches 里，
+                // 音频重建（rebuildAudioEngine → end() 会 _audioCaches.clear()）或 uncache 都可能
+                // 在 block 执行前把它析构 —— 0.4 秒后再解引用就是 use-after-free。
+                // 这两个值在 state==READY 后不会再变（isStreaming 是文件属性、duration 解码完成即定），
+                // 而播放时刻 cache 必然存活（本回调正是 cache 自己发起的），进 block 前求值拷出即可。
+                const bool longStreaming = (cache != nullptr) && cache->isStreaming() && cache->_duration > 1.0f;
+                const float cacheDuration = cache != nullptr ? cache->_duration : 0.0f;
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     ALint state2 = 0;
                     ALint offset2 = 0;
@@ -990,10 +1004,10 @@ void AudioEngineImpl::play2dImpl(AudioCache *cache, int audioID) {
                         // 这种情况下流式补数据线程也不会再工作（它只在 PLAYING/PAUSED 时补），
                         // 表现为"BGM 只播个开头就再也没声，直到退出场景重进"。
                         // 判据加 duration > 1s，避免把"本来就播完了的短流式音频"误判成异常。
-                        const bool longStreaming = (cache != nullptr) && cache->isStreaming() && cache->_duration > 1.0f;
+                        // （longStreaming / cacheDuration 在进本 block 前已求值拷出，见上方说明。）
                         if (state2 == AL_STOPPED && offset2 == offset && longStreaming) {
                             ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: stream source stopped without rendering any sample! audioID=%d offset=%d duration=%.2f (audio unit not running?)",
-                                  audioID, offset2, cache->_duration);
+                                  audioID, offset2, cacheDuration);
                             static NSTimeInterval s_lastNoRenderRecover = 0;
                             NSTimeInterval nowNoRender = [[NSDate date] timeIntervalSince1970];
                             if (nowNoRender - s_lastNoRenderRecover >= 5.0) {
@@ -1328,11 +1342,17 @@ void AudioEngineImpl::update(float dt) {
         // 也就是"切后台再回来"那套、实测能恢复的操作；旋转线程的自愈会把循环源重新拉起来。
         // 限制：①广告展示期间不做（bkHardRestartAudioIO 自己也会跳过）；
         //      ②只有 App 在前台才做（后台时 iOS 本来就挂起 AudioUnit，硬重启既无效又可能报错）；
-        //      ③5 秒一次、最多 5 次，避免反复打断其它声音。
+        //      ③5 秒一次、**每次事故**最多 5 次：连续 60 秒没有任何 player 再置位即视为
+        //        "设备已恢复健康、本次事故结束"，预算清零 —— 否则 5 次是整个进程生命周期的
+        //        总额，长会话跨多轮广告后自愈会被永久禁用（等于废掉这条修复线）。
+        static double s_lastNoProcessCheck = 0;
+        static NSTimeInterval s_lastNoProcessSeen = 0; // 最近一次观察到标志的时刻（含被 5 秒节流丢弃的置位）
+        static int s_noProcessRestartCount = 0;
         if (player->_deviceNotRendering.exchange(false)) {
-            static double s_lastNoProcessCheck = 0;
-            static int s_noProcessRestartCount = 0;
             NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
+            // 标志仍在置位 = 事故仍在持续：刷新"最近观察时刻"，健康清零的判据因此永远不会
+            // 在一次未结束的事故中途成立（清零只发生在"连续 60 秒无置位"之后）。
+            s_lastNoProcessSeen = nowTs;
             // 5 秒节流放在最外层：补数据线程每 25ms 就会把标志置真一次，这里必须限流，
             // 否则"已放弃"之类的日志会每 50ms 刷一条（自审抓到的坑）。
             if (nowTs - s_lastNoProcessCheck >= 5.0) {
@@ -1350,6 +1370,12 @@ void AudioEngineImpl::update(float dt) {
                     bkHardRestartAudioIO("noProcess");
                 }
             }
+        } else if (s_noProcessRestartCount > 0 &&
+                   [[NSDate date] timeIntervalSince1970] - s_lastNoProcessSeen >= 60.0) {
+            // 本 player 未置位且距上次观察到置位已超过 60 秒（60 > 一次事故最长 5 次 × 5 秒 = 25 秒，
+            // 且期间标志持续置位会不断刷新 s_lastNoProcessSeen，走不到这里）→ 新事故预算恢复。
+            ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] update: device rendering recovered (no flag for >=60s), reset noProcess restart budget");
+            s_noProcessRestartCount = 0;
         }
 #endif
 
