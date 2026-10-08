@@ -1306,6 +1306,39 @@ void AudioEngineImpl::update(float dt) {
         alSource = player->_alSource;
         alGetSourcei(alSource, AL_SOURCE_STATE, &sourceState);
 
+#if CC_PLATFORM == CC_PLATFORM_IOS
+        // 【僵尸设备自愈】补数据线程判定"源在 PLAYING、队列里有数据、却连续 2 秒零消费"
+        // （2026-10-08 真机日志：广告回来 resume 后 state=4114 queued=4 processed=0，
+        //  短音效播放结束时 offset 停在 0，而广告前是跑满 → 底层 AudioUnit 没在拉数据）。
+        // 这里做主线程侧的动作：硬重启音频 I/O（setActive NO→YES + 重绑），
+        // 也就是"切后台再回来"那套、实测能恢复的操作；旋转线程的自愈会把循环源重新拉起来。
+        // 限制：①广告展示期间不做（bkHardRestartAudioIO 自己也会跳过）；
+        //      ②只有 App 在前台才做（后台时 iOS 本来就挂起 AudioUnit，硬重启既无效又可能报错）；
+        //      ③5 秒一次、最多 5 次，避免反复打断其它声音。
+        if (player->_deviceNotRendering.exchange(false)) {
+            static double s_lastNoProcessCheck = 0;
+            static int s_noProcessRestartCount = 0;
+            NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
+            // 5 秒节流放在最外层：补数据线程每 25ms 就会把标志置真一次，这里必须限流，
+            // 否则"已放弃"之类的日志会每 50ms 刷一条（自审抓到的坑）。
+            if (nowTs - s_lastNoProcessCheck >= 5.0) {
+                s_lastNoProcessCheck = nowTs;
+                bool appActive = [UIApplication sharedApplication].applicationState == UIApplicationStateActive;
+                if (!appActive) {
+                    ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] update: audioID=%d device-not-rendering but app is not active, skip hard restart", audioID);
+                } else if (s_noProcessRestartCount >= 5) {
+                    ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] update: audioID=%d device-not-rendering, already restarted %d times, suppress further attempts",
+                          audioID, s_noProcessRestartCount);
+                } else {
+                    ++s_noProcessRestartCount;
+                    ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] update: audioID=%d source=%u device not rendering (playing with queued buffers but none processed) -> hard restart audio I/O (attempt %d)",
+                          audioID, alSource, s_noProcessRestartCount);
+                    bkHardRestartAudioIO("noProcess");
+                }
+            }
+        }
+#endif
+
         if (player->_removeByAudioEngine) {
             AudioEngine::remove(audioID);
             _threadMutex.lock();

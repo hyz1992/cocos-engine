@@ -29,6 +29,7 @@
 #include "base/Macros.h"
 
 #include <OpenAL/al.h>
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -77,6 +78,12 @@ protected:
     bool _timeDirty;
     bool _isRotateThreadExited;
     std::atomic_bool _needWakeupRotateThread;
+
+    // 【僵尸设备检测】补数据线程发现"源在 PLAYING、队列里有数据、却连续若干秒没有任何缓冲被消费"
+    // 就把它置真（= 底层 AudioUnit 没在拉数据）。由 AudioEngineImpl::update()（主线程）消费，
+    // 在那里做硬重启（setActive NO→YES + 重绑，等价于"切后台再回来"）。
+    // 放在这里而不是直接在补数据线程里做：硬重启要碰 AVAudioSession，只能在主线程/持有会话的那一侧做。
+    std::atomic_bool _deviceNotRendering{false};
 
     std::mutex _play2dMutex;
 

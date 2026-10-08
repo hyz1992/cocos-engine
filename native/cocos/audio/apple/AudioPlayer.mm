@@ -271,10 +271,19 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
         auto lastRotateDiag = std::chrono::steady_clock::now();
         auto lastResumeAttempt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
         ALint diagQueued = 0;
+        // 僵尸设备检测（2026-10-08 真机日志实锤）：广告回来 resume 之后，源明明 PLAYING、
+        // 队列里 4 个缓冲，却"一个都没被消费"（Rotate(idle): state=4114 queued=4 processed=0），
+        // 同时短音效结束时 offset 停在 0（广告前是跑满 5760）—— 即底层 AudioUnit 根本没在拉数据。
+        // 正常情况下一个缓冲最多 50ms 就该播完，所以"PLAYING + 有队列 + 连续 2 秒零消费"就是铁证。
+        auto idleStart = std::chrono::steady_clock::now();
+        bool trackingIdle = false;
+        auto lastNoProcessReport = std::chrono::steady_clock::now() - std::chrono::seconds(30);
 
         while (!_isDestroyed) {
             alGetSourcei(_alSource, AL_SOURCE_STATE, &sourceState);
             alGetSourcei(_alSource, AL_BUFFERS_QUEUED, &diagQueued);
+            ALint processedAtTop = 0;
+            alGetSourcei(_alSource, AL_BUFFERS_PROCESSED, &processedAtTop);
             bool rotateDidWork = false;
             /* On IOS, audio state will lie, when the system is not fully foreground,
              * openAl will process the buffer in queue, but our condition cannot make sure that the audio
@@ -343,6 +352,25 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
                         }
                     }
                 }
+            }
+
+            // 僵尸设备判定：源在 PLAYING、队列里有数据，却连续 2 秒没有任何缓冲被消费。
+            // 只**标记**，真正的硬重启交给 AudioEngineImpl::update()（主线程，能碰 AVAudioSession）。
+            if (sourceState == AL_PLAYING && diagQueued > 0 && processedAtTop == 0) {
+                auto nowIdle = std::chrono::steady_clock::now();
+                if (!trackingIdle) {
+                    trackingIdle = true;
+                    idleStart = nowIdle;
+                } else if (std::chrono::duration_cast<std::chrono::milliseconds>(nowIdle - idleStart).count() >= 2000) {
+                    if (std::chrono::duration_cast<std::chrono::milliseconds>(nowIdle - lastNoProcessReport).count() >= 5000) {
+                        lastNoProcessReport = nowIdle;
+                        ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate(id=%u): source PLAYING with %d queued but NOTHING processed for >=2s -> device not rendering, request audio I/O hard restart",
+                              _id, diagQueued);
+                    }
+                    _deviceNotRendering = true;
+                }
+            } else {
+                trackingIdle = false;
             }
 
             // 限频诊断：只有当"本轮没有做任何补数据"且持续 1 秒以上时才打一行，
