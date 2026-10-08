@@ -60,6 +60,14 @@ ccstd::unordered_map<ccstd::string, unsigned> jsbFunctionInvokedRecords;
     #define RETRUN_VAL_IF_FAIL(cond, val) \
         if (!(cond)) return val
 
+// 打印 JS 异常时要不要输出**完整**源码行。
+// 默认 0：压缩后的 bundle 整包只有一行，完整输出会让单次报错产生数百 KB 日志
+// （线上出现过"小错误 → 主线程被日志拖死、界面卡死"），所以只保留出错位置附近的窗口。
+// 需要完整源码排查时把它置 1 重新编译即可。
+#ifndef CC_JS_EXCEPTION_FULL_SOURCE
+    #define CC_JS_EXCEPTION_FULL_SOURCE 0
+#endif
+
 namespace se {
 AutoHandleScope::AutoHandleScope()
 : _handleScope(v8::Isolate::GetCurrent()) {
@@ -265,6 +273,33 @@ public:
 
 ScriptEngineV8Context *gSharedV8 = nullptr;
     #endif // CC_EDITOR
+
+// V8 给的是 **UTF-16 code unit** 列号，而 GetSourceLine() 转出来的源码行是 **UTF-8 字节串**。
+// 出错位置前面只要有非 ASCII（本项目 bundle 里中文不少），把列号直接当字节下标使用，
+// 打印出来的窗口与 `^` 下划线就会整体错位（不崩、不越界，但会指错地方）。
+// 这里做一次换算：4 字节 UTF-8 序列（增补平面）对应 2 个 UTF-16 单元，其余对应 1 个；
+// 结果夹取到 [0, size]，避免越界。
+static size_t utf16ColumnToByteOffset(const ccstd::string &utf8, int column) {
+    if (column <= 0) {
+        return 0;
+    }
+    size_t bytes = 0;
+    int units = 0;
+    while (bytes < utf8.size() && units < column) {
+        const auto c = static_cast<unsigned char>(utf8[bytes]);
+        size_t len = 1;
+        if ((c & 0xE0U) == 0xC0U) {
+            len = 2;
+        } else if ((c & 0xF0U) == 0xE0U) {
+            len = 3;
+        } else if ((c & 0xF8U) == 0xF0U) {
+            len = 4;
+        }
+        bytes += len;
+        units += (len == 4) ? 2 : 1;
+    }
+    return bytes > utf8.size() ? utf8.size() : bytes;
+}
 } // namespace
 
 ScriptEngine *ScriptEngine::instance = nullptr;
@@ -1139,6 +1174,10 @@ void ScriptEngine::reportException(v8::Isolate *isolate, v8::Local<v8::Message> 
             const char *sourcelineString = toCString(sourcelinevalue);
             int const start = message->GetStartColumn(context).FromJust();
             int const end = message->GetEndColumn(context).FromJust();
+            const ccstd::string source(sourcelineString);
+            // 列号是 UTF-16 单元，source 是 UTF-8 字节串：先换算再当字节下标用
+            const size_t startPos = utf16ColumnToByteOffset(source, start);
+            const size_t endPos = utf16ColumnToByteOffset(source, end);
 
             // 压缩后的 bundle 常常整包只有一行：V8 的 GetSourceLine() 会把整包（几十万字符）
             // 返回，再叠加按列号打印的空格/^ 下划线，单次 JS 报错就能产生数百 KB 的同步日志，
@@ -1146,34 +1185,29 @@ void ScriptEngine::reportException(v8::Isolate *isolate, v8::Local<v8::Message> 
             // 这里在发布行为下只保留出错位置附近的窗口；需要完整源码时把
             // CC_JS_EXCEPTION_FULL_SOURCE 置 1 重新编译即可（诊断能力本身不受影响：
             // message 与完整 stack 照旧，回调与上报链路完全不变）。
-#ifndef CC_JS_EXCEPTION_FULL_SOURCE
-    #define CC_JS_EXCEPTION_FULL_SOURCE 0
-#endif
 #if CC_JS_EXCEPTION_FULL_SOURCE
-            ss << sourcelineString << '\n';
-            for (int i = 0; i < start; i++) {
+            ss << source << '\n';
+            for (size_t i = 0; i < startPos; i++) {
                 ss << ' ';
             }
-            for (int i = start; i < end; i++) {
+            for (size_t i = startPos; i < endPos; i++) {
                 ss << '^';
             }
             ss << '\n';
 #else
-            const ccstd::string source(sourcelineString);
             const size_t maxContext = 200; // 出错位置前后各保留的字符数
             if (source.size() <= maxContext * 2) {
-                // 非压缩代码（手写 TS / 开发构建）永远走这里，输出与改动前逐字节一致
+                // 非压缩代码（手写 TS / 开发构建）永远走这里：纯 ASCII 时与改动前逐字节一致；
+                // 含非 ASCII 时下划线位置比改动前更准（原来把 UTF-16 列号当字节数用）。
                 ss << source << '\n';
-                for (int i = 0; i < start; i++) {
+                for (size_t i = 0; i < startPos; i++) {
                     ss << ' ';
                 }
-                for (int i = start; i < end; i++) {
+                for (size_t i = startPos; i < endPos; i++) {
                     ss << '^';
                 }
                 ss << '\n';
             } else {
-                const size_t startPos = (start > 0) ? static_cast<size_t>(start) : 0;
-                const size_t endPos = (end > 0) ? static_cast<size_t>(end) : 0;
                 // 按 UTF-8 字符边界取窗口，避免切断多字节字符（否则日志/上报里会出现非法 UTF-8）
                 auto isContinuationByte = [](unsigned char c) { return (c & 0xC0U) == 0x80U; };
                 size_t winFrom = (startPos > maxContext) ? (startPos - maxContext) : 0;

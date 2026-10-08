@@ -353,7 +353,15 @@ void AudioCache::invokingLoadCallbacks() {
         ALOGV("AudioCache (%p) no current application, don't invoke preload callback ...", this);
         return;
     }
-    auto scheduler = CC_CURRENT_ENGINE()->getScheduler();
+    // 注意：不能再用 CC_CURRENT_ENGINE() —— 它展开为 CC_CURRENT_APPLICATION_SAFE()->getEngine()，
+    // 会**再查一次** Application：两次查找之间应用可能被释放（对空指针取 vtable）；
+    // 而且 getEngine() 本身也可能返回空。这里用刚持有的 application / engine 串起来判空。
+    auto engine = application->getEngine();
+    if (engine == nullptr) {
+        ALOGV("AudioCache (%p) no current engine, don't invoke preload callback ...", this);
+        return;
+    }
+    auto scheduler = engine->getScheduler();
     if (scheduler == nullptr) {
         ALOGV("AudioCache (%p) no scheduler, don't invoke preload callback ...", this);
         return;

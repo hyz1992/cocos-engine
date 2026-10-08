@@ -54,12 +54,20 @@ CC_FORCE_INLINE void fillIndexBuffers(RenderDrawInfo* drawInfo) { // NOLINT(read
 
     // 索引数据缓冲由 JS 侧分配（ArrayBuffer），容量由 MeshBuffer 同步到 UIMeshBuffer；
     // 0 表示未知，此时不做检查（与旧行为完全一致）。越界时只报错并跳过本次写入：
-    // 宁可少画一次，也不能把 JS 的 ArrayBuffer 写穿 —— 那破坏的是堆，后续会在完全
-    // 不相干的对象上随机崩溃（线上表现为各种 SDK/V8 回调里的"指针变垃圾"）。
+    // 写穿 JS 的 ArrayBuffer 破坏的是堆，后续会在完全不相干的对象上随机崩溃
+    // （线上表现为各种 SDK/V8 回调里的"指针变垃圾"），两害相权取其轻。
+    // 注意：本函数只负责"不写越界"，不会阻止调用方继续提交这条 draw info ——
+    // 触发后该区间可能仍是未写入/被别的 draw info 复用的数据，即**可能出现绘制错乱**，
+    // 而不是"少画一次"。要彻底避免需要在上层跳过提交（改动面更大，需真机验证，故未做）。
     const uint32_t indexCapacity = buffer->getIndexCapacity();
     if (indexCapacity > 0U && static_cast<uint64_t>(indexOffset) + indexCount > indexCapacity) {
-        CC_LOG_ERROR("Batcher2d: index buffer overflow, skip. offset=%u count=%u capacity=%u",
-                     indexOffset, indexCount, indexCapacity);
+        // 日志限频：容量不一致会每帧、每条 draw info 触发一次；线上有过"日志把主线程拖死"的教训
+        static uint32_t s_indexOverflowLogs = 0U;
+        if (s_indexOverflowLogs < 4U) {
+            ++s_indexOverflowLogs;
+            CC_LOG_ERROR("Batcher2d: index buffer overflow, skip write. offset=%u count=%u capacity=%u",
+                         indexOffset, indexCount, indexCapacity);
+        }
         return;
     }
 
@@ -84,8 +92,13 @@ CC_FORCE_INLINE bool checkVertexWrite(RenderDrawInfo* drawInfo, const float* vbB
     }
     const auto offset = static_cast<uint32_t>(vbBuffer - base);
     if (static_cast<uint64_t>(offset) + size > capacity) {
-        CC_LOG_ERROR("Batcher2d: vertex buffer overflow, skip. offset=%u size=%u capacity=%u",
-                     offset, size, capacity);
+        // 日志限频，理由同索引守卫（避免每帧刷屏把主线程拖死）
+        static uint32_t s_vertexOverflowLogs = 0U;
+        if (s_vertexOverflowLogs < 4U) {
+            ++s_vertexOverflowLogs;
+            CC_LOG_ERROR("Batcher2d: vertex buffer overflow, skip write. offset=%u size=%u capacity=%u",
+                         offset, size, capacity);
+        }
         return false;
     }
     return true;

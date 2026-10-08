@@ -315,7 +315,10 @@ void doBufferTextureCopy(const uint8_t *const *buffers, Texture *texture, const 
     // ThreadSafeLinearAllocator 构造函数里的 CC_ASSERT 在 Release 下会被编译掉，
     // 于是 _buffer 为 null、doAllocate 静默返回 nullptr，后面的 memcpy/memmove 直接写空指针
     // （线上表现为 SIGSEGV / KERN_INVALID_ADDRESS at 0x0）。必须显式检查并放弃本次拷贝。
-    if (allocator == nullptr || allocator->getBuffer() == nullptr) {
+    // 注意：ThreadSafeLinearAllocator 对 **0 字节**请求按设计返回 nullptr（ThreadSafeLinearAllocator.cpp:50），
+    // 那不是失败。所以下面的判空都必须带上"请求量非 0"的条件，否则会把合法的
+    // "count==0 / 某层 size==0"（原本是空操作）误判成失败并放弃整次拷贝。
+    if (allocator == nullptr || (totalSize > 0U && allocator->getBuffer() == nullptr)) {
         CC_LOG_ERROR("doBufferTextureCopy: failed to allocate %u bytes of staging memory, skip copy", static_cast<uint32_t>(totalSize));
         delete allocator;
         return;
@@ -323,7 +326,7 @@ void doBufferTextureCopy(const uint8_t *const *buffers, Texture *texture, const 
 
     auto *actorRegions = allocator->allocate<BufferTextureCopy>(count);
     const auto **actorBuffers = allocator->allocate<const uint8_t *>(bufferCount);
-    if (actorRegions == nullptr || actorBuffers == nullptr) {
+    if ((count > 0U && actorRegions == nullptr) || (bufferCount > 0U && actorBuffers == nullptr)) {
         CC_LOG_ERROR("doBufferTextureCopy: failed to allocate regions(%u)/buffers(%u), skip copy", count, bufferCount);
         delete allocator;
         return;
@@ -346,7 +349,7 @@ void doBufferTextureCopy(const uint8_t *const *buffers, Texture *texture, const 
 
         for (uint32_t l = 0; l < region.texSubres.layerCount; l++) {
             auto *buffer = allocator->allocate<uint8_t>(size, alignment);
-            if (buffer == nullptr) {
+            if (size > 0U && buffer == nullptr) {
                 CC_LOG_ERROR("doBufferTextureCopy: failed to allocate %u bytes for layer %u/%u, skip copy", size, l, region.texSubres.layerCount);
                 delete allocator;
                 return;

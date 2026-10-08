@@ -777,7 +777,7 @@ void CCMTLCommandBuffer::copyBuffersToTexture(const uint8_t *const *buffers, Tex
         auto copyFunc = [&](const uint8_t * const buffer, const MTLRegion& mtlRegion, uint32_t size, uint32_t slice, uint8_t depth) {
             if(dstTexture.storageMode != MTLStorageModePrivate || mtlTexture->isPVRTC()) {
                 ccstd::vector<uint8_t> data(size);
-                if (data.data() == nullptr) {
+                if (size > 0U && data.data() == nullptr) {
                     CC_LOG_ERROR("CCMTLCommandBuffer::copyBuffersToTexture: failed to allocate %u bytes of temp data, skip copy", size);
                     return;
                 }
@@ -793,7 +793,7 @@ void CCMTLCommandBuffer::copyBuffersToTexture(const uint8_t *const *buffers, Tex
                 CCMTLGPUBuffer stagingBuffer;
                 stagingBuffer.instanceSize = bufferSliceSize;
                 _mtlDevice->gpuStagingBufferPool()->alloc(&stagingBuffer, alignment);
-                if (stagingBuffer.mappedData == nullptr) {
+                if (bufferSliceSize > 0U && stagingBuffer.mappedData == nullptr) {
                     CC_LOG_ERROR("CCMTLCommandBuffer::copyBuffersToTexture: staging buffer alloc failed for %u bytes, skip copy", bufferSliceSize);
                     return;
                 }
@@ -809,8 +809,9 @@ void CCMTLCommandBuffer::copyBuffersToTexture(const uint8_t *const *buffers, Tex
         for(uint32_t l = region.texSubres.baseArrayLayer; l < region.texSubres.layerCount + region.texSubres.baseArrayLayer; ++l) {
             for(uint32_t d = static_cast<uint32_t>(targetOffset.z); d < targetSize.depth + static_cast<uint32_t>(targetOffset.z); ++d) {
                 if(compactMemory) {
-                    const auto *convertedData = mu::convertData(buffers[i] + region.buffOffset + (l - region.texSubres.baseArrayLayer) * bufferBytesPerImage
-                                                                + (d - targetOffset.z) * bufferSliceSize,
+                    const auto *convertSource = buffers[i] + region.buffOffset + (l - region.texSubres.baseArrayLayer) * bufferBytesPerImage
+                                                                + (d - targetOffset.z) * bufferSliceSize;
+                    const auto *convertedData = mu::convertData(convertSource,
                                                                 bufferPixelWidth * blockSize.second, format);
 
                     MTLRegion mtlRegion = {
@@ -820,13 +821,17 @@ void CCMTLCommandBuffer::copyBuffersToTexture(const uint8_t *const *buffers, Tex
 
                     copyFunc(convertedData, mtlRegion, bufferSliceSize, l, d);
 
-                    if (format == Format::RGB8 || format == Format::RGB32F) {
+                    // convertData 在 **分配失败时会原样返回入参**（MTLUtils.mm convertRGB8ToRGBA8 /
+                    // convertRGB32FToRGBA32F 的 `return source`）：那个指针属于调用方（可能来自 JS 的
+                    // ArrayBuffer），free 它会破坏堆。只有确实换了指针才释放。
+                    if ((format == Format::RGB8 || format == Format::RGB32F) && convertedData != convertSource) {
                         CC_FREE(convertedData);
                     }
                 } else {
                     for(size_t h = targetOffset.y; h < targetSize.height + targetOffset.y; h += blockSize.second) {
-                        const auto *convertedData = mu::convertData(buffers[i] + region.buffOffset + (l - region.texSubres.baseArrayLayer) * bufferBytesPerImage
-                                                                    + (d - targetOffset.z) * bufferSliceSize + h / blockSize.second * bufferBytesPerRow,
+                        const auto *convertSource = buffers[i] + region.buffOffset + (l - region.texSubres.baseArrayLayer) * bufferBytesPerImage
+                                                                    + (d - targetOffset.z) * bufferSliceSize + h / blockSize.second * bufferBytesPerRow;
+                        const auto *convertedData = mu::convertData(convertSource,
                                                                     bufferPixelWidth * blockSize.second, format);
 
                         MTLRegion mtlRegion = {
@@ -836,7 +841,7 @@ void CCMTLCommandBuffer::copyBuffersToTexture(const uint8_t *const *buffers, Tex
 
                         copyFunc(convertedData, mtlRegion, bytesPerRowForTarget, l, d);
 
-                        if (format == Format::RGB8 || format == Format::RGB32F) {
+                        if ((format == Format::RGB8 || format == Format::RGB32F) && convertedData != convertSource) {
                             CC_FREE(convertedData);
                         }
                     }
