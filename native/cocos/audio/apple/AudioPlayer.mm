@@ -238,8 +238,16 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
     char *tmpBuffer = nullptr;
     AudioDecoder decoder;
     long long rotateSleepTime = static_cast<long long>(QUEUEBUFFER_TIME_STEP * 1000) / 2;
+    // 流式播放的初始只排队 QUEUEBUFFER_NUM(4) × QUEUEBUFFER_TIME_STEP(0.05s) ≈ 0.2 秒音频，
+    // 之后全靠本线程每 25ms 续一次。所以"BGM 只播个开头就停"= 本线程没在工作（或提前退出）。
+    // 下面几条日志把线程的 start / 提前退出 / 正常退出都记下来，便于一次复现就定位。
+    ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate: start, offsetFrame=%d queuedFrames=%u sleepMs=%lld",
+          offsetFrame, _audioCache ? _audioCache->_queBufferFrames : 0, rotateSleepTime);
     do {
-        BREAK_IF(!decoder.open(_audioCache->_fileFullPath.c_str()));
+        if (!decoder.open(_audioCache->_fileFullPath.c_str())) {
+            ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate: decoder.open FAILED -> no refill, playback will stop after the queued buffers");
+            break;
+        }
 
         uint32_t framesRead = 0;
         const uint32_t framesToRead = _audioCache->_queBufferFrames;
@@ -254,9 +262,18 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
         ALint sourceState;
         ALint bufferProcessed = 0;
         bool needToExitThread = false;
+        // 诊断（限频 1 秒）：流式补数据只在这两个条件成立时才会发生 ——
+        //   ① source 处于 PLAYING/PAUSED；
+        //   ② AL_BUFFERS_PROCESSED > 0（有播完可回收的缓冲）。
+        // 线上"BGM 只播个开头就停"（约 QUEUEBUFFER_NUM × QUEUEBUFFER_TIME_STEP ≈ 2 秒后无声）
+        // 就是这两个条件之一不成立导致的：这里把实际取值打出来，一次复现即可定位。
+        auto lastRotateDiag = std::chrono::steady_clock::now();
+        ALint diagQueued = 0;
 
         while (!_isDestroyed) {
             alGetSourcei(_alSource, AL_SOURCE_STATE, &sourceState);
+            alGetSourcei(_alSource, AL_BUFFERS_QUEUED, &diagQueued);
+            bool rotateDidWork = false;
             /* On IOS, audio state will lie, when the system is not fully foreground,
              * openAl will process the buffer in queue, but our condition cannot make sure that the audio
              * is playing as it's too short. Interesting IOS system.
@@ -264,6 +281,7 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
              */
             if (sourceState == AL_PLAYING || sourceState == AL_PAUSED) {
                 alGetSourcei(_alSource, AL_BUFFERS_PROCESSED, &bufferProcessed);
+                rotateDidWork = bufferProcessed > 0;
                 while (bufferProcessed > 0) {
                     bufferProcessed--;
                     if (_timeDirty) {
@@ -305,8 +323,25 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
                 }
             }
 
+            // 限频诊断：只有当"本轮没有做任何补数据"且持续 1 秒以上时才打一行，
+            // 避免正常播放时刷屏；一旦 BGM 卡住，这条日志会每秒出现一次并给出 state/queued/processed。
+            if (rotateDidWork) {
+                lastRotateDiag = std::chrono::steady_clock::now();
+            } else {
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRotateDiag).count() >= 1000) {
+                    lastRotateDiag = now;
+                    ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate(idle): state=%d queued=%d processed=%d loop=%d currTime=%.2f duration=%.2f -> no refill",
+                          sourceState, diagQueued, bufferProcessed, (int)_loop, _currTime, _audioCache ? _audioCache->_duration : 0.0f);
+                }
+            }
+
             std::unique_lock<std::mutex> lk(_sleepMutex);
             if (_isDestroyed || needToExitThread) {
+                // needToExitThread 只在"读到 0 帧且 loop=0"时置位：那之后不会再补数据，
+                // 对 loop=1 的 BGM 不该出现；出现即说明 loop 标记没生效。
+                ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate: exit loop, isDestroyed=%d needToExitThread=%d loop=%d",
+                      (int)_isDestroyed, (int)needToExitThread, (int)_loop);
                 break;
             }
 
