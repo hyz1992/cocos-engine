@@ -251,7 +251,6 @@ Batcher2d::Batcher2d(Root* root)
     _recordedRendererInfoQueue.reserve(100);
 
     getDefultTexture();
-    CC_LOG_WARNING("Batcher2d::Batcher2d");
 }
 
 Batcher2d::~Batcher2d() { // NOLINT
