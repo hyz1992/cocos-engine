@@ -890,15 +890,23 @@ export class Button extends Component {
             return;
         }
 
-        if (this._pressed) {
-            ComponentEventHandler.emitEvents(this.clickEvents, event);
-            this.node.emit(ButtonEventType.CLICK, this);
-        }
-        this._pressed = false;
-        this._updateState();
+        // 点击回调（clickEvents / CLICK）由业务脚本提供，可能抛异常。
+        // 原实现把 _pressed = false 和 _updateState() 放在回调之后，
+        // 一旦回调抛异常，按钮就会永久停在按下态：视觉上一直高亮，
+        // 且 _onTouchMove 会一直按「已按下」做命中判定与过渡。
+        // 用 finally 保证状态一定复位；异常照常向外抛，不影响报错上报。
+        try {
+            if (this._pressed) {
+                ComponentEventHandler.emitEvents(this.clickEvents, event);
+                this.node.emit(ButtonEventType.CLICK, this);
+            }
+        } finally {
+            this._pressed = false;
+            this._updateState();
 
-        if (event) {
-            event.propagationStopped = true;
+            if (event) {
+                event.propagationStopped = true;
+            }
         }
     }
 

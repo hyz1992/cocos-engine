@@ -1102,13 +1102,26 @@ export class Game extends EventTarget {
     }
 
     private _onHide (): void {
-        this.emit(Game.EVENT_HIDE);
-        this.pauseByEngine();
+        // 注意：emit 是 CallbacksInvoker.emit，对监听器没有 try/catch。
+        // 只要任意一个 EVENT_HIDE 监听抛异常，pauseByEngine() 就会被跳过，
+        // 引擎的暂停状态与真实前后台状态从此不一致。
+        // 最严重的后果在 _onShow：若 pauseByEngine 已生效（_pausedByEngine=true），
+        // 而 resumeByEngine 又因某个 EVENT_SHOW 监听抛异常被跳过，
+        // game 主循环（渲染 / 逻辑 / 输入派发）就会永久停在暂停态，表现为「切后台再回前台完全卡死」。
+        // 用 finally 保证引擎自身的暂停 / 恢复流程一定执行，异常照常向外抛，不影响报错上报。
+        try {
+            this.emit(Game.EVENT_HIDE);
+        } finally {
+            this.pauseByEngine();
+        }
     }
 
     private _onShow (): void {
-        this.emit(Game.EVENT_SHOW);
-        this.resumeByEngine();
+        try {
+            this.emit(Game.EVENT_SHOW);
+        } finally {
+            this.resumeByEngine();
+        }
     }
 
     private _onClose (): void {
