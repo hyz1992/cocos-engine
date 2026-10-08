@@ -683,14 +683,8 @@ export class NodeEventProcessor {
             event.type = NodeEventType.TOUCH_CANCEL;
         }
         event.bubbles = true;
-        // 监听器可能抛异常：_dispatchingTouch 必须在 finally 里复位，
-        // 否则它会一直停在这根手指上，节点销毁时 destroy() 会据此再补发一次
-        // TOUCH_CANCEL 给同一批（已经出问题的）监听器，在场景拆解阶段再抛一次。
-        try {
-            node.dispatchEvent(event);
-        } finally {
-            this._dispatchingTouch = null;
-        }
+        node.dispatchEvent(event);
+        this._dispatchingTouch = null;
     }
 
     private _handleTouchCancel (event: EventTouch): void {
@@ -701,11 +695,8 @@ export class NodeEventProcessor {
 
         event.type = NodeEventType.TOUCH_CANCEL;
         event.bubbles = true;
-        try {
-            node.dispatchEvent(event);
-        } finally {
-            this._dispatchingTouch = null;
-        }
+        node.dispatchEvent(event);
+        this._dispatchingTouch = null;
     }
 
     // #endregion handle touch event
