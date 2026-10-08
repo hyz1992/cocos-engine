@@ -241,8 +241,9 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
     // 流式播放的初始只排队 QUEUEBUFFER_NUM(4) × QUEUEBUFFER_TIME_STEP(0.05s) ≈ 0.2 秒音频，
     // 之后全靠本线程每 25ms 续一次。所以"BGM 只播个开头就停"= 本线程没在工作（或提前退出）。
     // 下面几条日志把线程的 start / 提前退出 / 正常退出都记下来，便于一次复现就定位。
-    ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate: start, offsetFrame=%d queuedFrames=%u sleepMs=%lld",
-          offsetFrame, _audioCache ? _audioCache->_queBufferFrames : 0, rotateSleepTime);
+    // 带上 player id：真机日志里这些行原来没有 id，无法判断是哪个 BGM 卡住（2026-10-08 复现时踩到）
+    ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate(id=%u): start, offsetFrame=%d queuedFrames=%u sleepMs=%lld",
+          _id, offsetFrame, _audioCache ? _audioCache->_queBufferFrames : 0, rotateSleepTime);
     do {
         if (!decoder.open(_audioCache->_fileFullPath.c_str())) {
             ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate: decoder.open FAILED -> no refill, playback will stop after the queued buffers");
@@ -336,8 +337,8 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
                         auto nowResume = std::chrono::steady_clock::now();
                         if (std::chrono::duration_cast<std::chrono::milliseconds>(nowResume - lastResumeAttempt).count() >= 1000) {
                             lastResumeAttempt = nowResume;
-                            ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate: loop source was STOPPED unexpectedly -> re-queue + play again (queued=%d)",
-                                  diagQueued);
+                            ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate(id=%u): loop source was STOPPED unexpectedly -> re-queue + play again (queued=%d)",
+                                  _id, diagQueued);
                             alSourcePlay(_alSource);
                         }
                     }
@@ -352,8 +353,8 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
                 auto now = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRotateDiag).count() >= 1000) {
                     lastRotateDiag = now;
-                    ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate(idle): state=%d queued=%d processed=%d loop=%d currTime=%.2f duration=%.2f -> no refill",
-                          sourceState, diagQueued, bufferProcessed, (int)_loop, _currTime, _audioCache ? _audioCache->_duration : 0.0f);
+                    ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate(idle): id=%u state=%d queued=%d processed=%d loop=%d currTime=%.2f duration=%.2f -> no refill",
+                          _id, sourceState, diagQueued, bufferProcessed, (int)_loop, _currTime, _audioCache ? _audioCache->_duration : 0.0f);
                 }
             }
 
@@ -361,8 +362,8 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
             if (_isDestroyed || needToExitThread) {
                 // needToExitThread 只在"读到 0 帧且 loop=0"时置位：那之后不会再补数据，
                 // 对 loop=1 的 BGM 不该出现；出现即说明 loop 标记没生效。
-                ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate: exit loop, isDestroyed=%d needToExitThread=%d loop=%d",
-                      (int)_isDestroyed, (int)needToExitThread, (int)_loop);
+                ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate(id=%u): exit loop, isDestroyed=%d needToExitThread=%d loop=%d",
+                      _id, (int)_isDestroyed, (int)needToExitThread, (int)_loop);
                 break;
             }
 

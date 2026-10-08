@@ -1098,7 +1098,10 @@ bool AudioEngineImpl::resume(int audioID) {
     }
     
     bool ret = true;
-    alSourcePlay(_audioPlayers[audioID]->_alSource);
+    ALuint source = _audioPlayers[audioID]->_alSource;
+    ALint offsetBefore = 0;
+    alGetSourcei(source, AL_SAMPLE_OFFSET, &offsetBefore);
+    alSourcePlay(source);
 
     auto error = alGetError();
     if (error != AL_NO_ERROR) {
@@ -1106,6 +1109,59 @@ bool AudioEngineImpl::resume(int audioID) {
         ALOGE("[AUDIO_DEBUG] AudioEngine: resume FAILED - audio id=%d, error=%x", audioID, error);
     } else {
         ALOGI("[AUDIO_DEBUG] AudioEngine: resume SUCCESS - audio id=%d", audioID);
+    }
+
+    // 【实证驱动的复查】resume 报成功 ≠ 真的在出声。2026-10-08 真机日志（广告后 BGM 无声、
+    // 切后台回来才有声）里能直接看到这条路径的两个坑：
+    //   ① resume 之后**还会发生多次会话恢复 + 上下文重绑**（2026-10-08 日志：
+    //      resume SUCCESS - audio id=247 之后紧跟 3 次 AudioRestore(delayed) + Rebind(delayed)），
+    //      而重绑（alcMakeContextCurrent(nullptr) 再挂回）本身会把所有源停掉；
+    //   ② 底层 AudioUnit 没在拉数据时，AL 调用仍然全部成功、源状态也报 PLAYING（"僵尸设备"）。
+    // 两者都表现为"AL 说成功、用户没声音"，而原来只有 play2dImpl 有 0.4 秒复查，resume 这条
+    // 路径完全没有探针 —— 所以"广告后 BGM 无声"一直无法从日志判定。
+    // 这里补上同样的 0.4 秒复查：偏移推进 = 真的在渲染；STOPPED = 被重绑停掉了（流式循环源由
+    // rotateBufferThread 的自愈重播）；PLAYING 但偏移不动 = 僵尸设备 → 复用已有的硬重启自愈。
+    if (ret) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            (void)alGetError(); // 清掉可能残留的 AL 错误态，避免污染别处对 alGetError() 的判读
+            ALint state2 = 0;
+            ALint offset2 = 0;
+            ALint queued2 = 0;
+            alGetSourcei(source, AL_SOURCE_STATE, &state2);
+            alGetSourcei(source, AL_SAMPLE_OFFSET, &offset2);
+            alGetSourcei(source, AL_BUFFERS_QUEUED, &queued2);
+            if (state2 == AL_STOPPED) {
+                ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] resume: source STOPPED after resume audioID=%d source=%u offset=%d (context rebind stopped it? streaming loop self-heals)",
+                      audioID, source, offset2);
+            } else if (state2 == AL_PLAYING && queued2 > 0 && offset2 == offsetBefore) {
+                ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] resume: STALLED! audioID=%d source=%u state=%d offset stuck at %d (device not rendering)",
+                      audioID, source, state2, offset2);
+                static NSTimeInterval s_lastResumeStalled = 0;
+                NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
+                if (nowTs - s_lastResumeStalled >= 5.0) {
+                    s_lastResumeStalled = nowTs;
+                    bkHardRestartAudioIO("resumeStalled");
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        ALint state3 = 0;
+                        ALint offset3 = 0;
+                        alGetSourcei(source, AL_SOURCE_STATE, &state3);
+                        alGetSourcei(source, AL_SAMPLE_OFFSET, &offset3);
+                        if (state3 == AL_PLAYING && offset3 == offsetBefore) {
+                            ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] resume: StalledRecover FAILED, still stuck at %d (audioID=%d)", offset3, audioID);
+                        } else {
+                            ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] resume: StalledRecover OK, offset %d -> %d (audioID=%d)", offsetBefore, offset3, audioID);
+                        }
+                    });
+                }
+            } else {
+                // 正常推进用 D 级，避免每次 resume 都刷屏。
+                // 注意这里也覆盖"队列空却在 PLAYING"的情况（queued2==0 且偏移不动）——
+                // 那种源本来就没有数据可放，不是设备问题，所以不触发硬重启。
+                ALOGD("[AUDIO_DEBUG][BKAUDIOTRACE] resume: progress ok audioID=%d source=%u state=%d queued=%d offset %d -> %d",
+                      audioID, source, state2, queued2, offsetBefore, offset2);
+            }
+            (void)alGetError();
+        });
     }
 
     return ret;

@@ -65,6 +65,24 @@ uintptr_t SystemWindow::getWindowLayer() const {
         UIView *view = UIApplication.sharedApplication.delegate.window.rootViewController.view;
         if (view) {
             _windowLayer = reinterpret_cast<uintptr_t>(view.layer);
+
+            // A1 第二轮（真机日志驱动）：不仅"取 layer"要在主线程，**改 layer 的属性**也不能在
+            // 渲染线程做 —— 对"由 view 支持的 layer"，UIKit 会拦截属性修改并在非主线程时报：
+            //   Modifying properties of a view's layer off the main thread is not allowed:
+            //   view <View: …> with associated view controller <ViewController: …>
+            // 其中会被拦截的是 CALayer 属性 presentsWithTransaction（原来在
+            // CCMTLSwapchain::doInit 的 lambda 里设置，栈正是报错点）；而 pixelFormat /
+            // framebufferOnly 是 CAMetalLayer 自己的属性，改它们不会走这条记账路径，
+            // 实测不报，所以仍留在 swapchain 侧。
+            //
+            // 取值：旧代码无论 _vsyncMode 落到哪一支，最终都是 presentsWithTransaction = NO
+            // （VsyncMode::ON 还会因缺 break 落到下一支再设一次 NO），所以在主线程固定设 NO
+            // 与改动前**行为等价**；即使渲染线程走 fallback 路径、这里没设过，CALayer 的默认值
+            // 也是 NO，仍然等价。
+            CAMetalLayer *metalLayer = (CAMetalLayer *)view.layer;
+            if ([metalLayer isKindOfClass:[CAMetalLayer class]]) {
+                metalLayer.presentsWithTransaction = NO;
+            }
         }
     }
     return _windowLayer;

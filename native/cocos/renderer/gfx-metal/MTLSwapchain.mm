@@ -88,13 +88,14 @@ void CCMTLSwapchain::doInit(const SwapchainInfo& info) {
     if (layer.pixelFormat == MTLPixelFormatInvalid) {
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     }
+    // framebufferOnly 是 CAMetalLayer 自己的属性，改它不会走 UIKit 对"view 支持的 layer"的记账，
+    // 所以放在渲染线程是安全的（A1 第二轮实测：真机不再对这两行报任何违规）。
     layer.framebufferOnly = NO;
+#if CC_PLATFORM == CC_PLATFORM_MACOS
     //setDisplaySyncEnabled : physic device refresh rate.
     //setPresentsWithTransaction : Core Animation transactions update rate.
     auto syncModeFunc = [&](BOOL sync, BOOL transaction) {
-#if CC_PLATFORM == CC_PLATFORM_MACOS
         [layer setDisplaySyncEnabled:sync];
-#endif
         [layer setPresentsWithTransaction:transaction];
     };
     switch (_vsyncMode) {
@@ -110,6 +111,18 @@ void CCMTLSwapchain::doInit(const SwapchainInfo& info) {
         default:
             break;
     }
+#else
+    // iOS 上**不能**在这里改 presentsWithTransaction：它是 CALayer 属性，UIKit 对"由 view 支持的
+    // layer"会拦截修改并在非主线程时报（A1 第二轮的真机日志，栈就是原来这个 lambda）：
+    //   Modifying properties of a view's layer off the main thread is not allowed:
+    //   view <View: …> with associated view controller <ViewController: …>
+    //   … CCMTLSwapchain::doInit(…)::$_0::operator() …
+    // 取值本来就是常数：无论 _vsyncMode 落到哪一支，presentsWithTransaction 都是 NO
+    // （VsyncMode::ON 还会因为缺 break 落到下一支再设一次 NO）。所以改在**主线程**解析 layer 时
+    // 一次性设好（见 SystemWindow::getWindowLayer()），渲染线程不再碰它。
+    // _vsyncMode 在 iOS 上因此不再参与 layer 配置；若将来真要支持 OFF/ON 的差别，必须把
+    // 对应设置也放到主线程那条路径上，而不是搬回这里。
+#endif
     _gpuSwapchainObj->mtlLayer = layer;
 
     //    MTLPixelFormatBGRA8Unorm
