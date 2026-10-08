@@ -61,6 +61,8 @@ public:
 protected:
     void setSkipReadDataTask(bool isSkip) { _isSkipReadDataTask = isSkip; };
     void readDataTask(unsigned int selfId);
+    // 归还上一轮解码留下的 OpenAL buffer 与流式队列缓冲，使 readDataTask 可以重复进入
+    void releaseDecodedResources();
 
     void invokingPlayCallbacks();
 

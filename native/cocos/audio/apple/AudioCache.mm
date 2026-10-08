@@ -126,6 +126,48 @@ AudioCache::~AudioCache() {
     _readDataTaskMutex.unlock();
 }
 
+// 归还本 cache 上一轮解码留下的资源（OpenAL buffer + 流式队列缓冲），供 readDataTask 重入前调用。
+//
+// 为什么需要：_alBufferId / _queBuffers / _queBufferSize / _queBufferFrames 都是"只写不还"的
+// 成员，而 readDataTask 是"从零重新解码"的加载器。同一个 cache 被再次调度时，
+// alGenBuffers 会覆盖旧 buffer 名、流式分支的 malloc 会覆盖旧指针，旧的那一份就此泄漏
+// （一个 AL buffer 里装的可能是整首 PCM，队列缓冲是 4 份）。本函数在重新分配前把它们还掉。
+//
+// 顺序要点（防悬空名字）：删完必须把 _alBufferId 置回 INVALID_AL_BUFFER_ID。
+// 本函数收尾处的失败分支与 ~AudioCache 都用 alIsBuffer() 兜底，所以不会真的重复删除；
+// 但若让 _alBufferId 停在"已经删掉的名字"上，这个 cache 的成员值与 OpenAL 的真实状态就
+// 不一致了 —— 一旦后面有别的路径按 _alBufferId 直接 alSourcei(AL_BUFFER, …)，就会引用
+// 一个已被删除的 buffer。置回 INVALID 让"值"和"事实"始终一致。
+// 归零 _queBufferFrames 则让 ~AudioCache 与这里对"有没有队列缓冲"的判断保持一致。
+// 首次进入（构造函数刚初始化完）时所有成员都是初值，本函数是空操作。
+void AudioCache::releaseDecodedResources() {
+    ALuint releasedAlBuffer = INVALID_AL_BUFFER_ID;
+    if (_alBufferId != INVALID_AL_BUFFER_ID) {
+        if (alIsBuffer(_alBufferId)) {
+            releasedAlBuffer = _alBufferId;
+            alDeleteBuffers(1, &_alBufferId);
+        }
+        // 无论删没删成功，都不再引用旧名字
+        _alBufferId = INVALID_AL_BUFFER_ID;
+    }
+
+    int releasedQueBuffers = 0;
+    for (int index = 0; index < QUEUEBUFFER_NUM; ++index) {
+        if (_queBuffers[index] != nullptr) {
+            free(_queBuffers[index]);
+            _queBuffers[index] = nullptr;
+            _queBufferSize[index] = 0;
+            ++releasedQueBuffers;
+        }
+    }
+    _queBufferFrames = 0;
+
+    if (releasedAlBuffer != INVALID_AL_BUFFER_ID || releasedQueBuffers > 0) {
+        ALOGW("[AUDIO_DEBUG] AudioCache(id=%u) readDataTask re-entered, released alBuffer=%u and %d queue buffer(s)",
+              _id, releasedAlBuffer, releasedQueBuffers);
+    }
+}
+
 void AudioCache::readDataTask(unsigned int selfId) {
     //Note: It's in sub thread
     ALOGVV("readDataTask, cache id=%u", selfId);
@@ -136,9 +178,20 @@ void AudioCache::readDataTask(unsigned int selfId) {
     // 本函数是"从零重新解码"的加载器（重新 malloc _pcmData、从 seek(0) 开始读），
     // 但 _framesRead 是跨调用累加的成员变量，此前依赖"每个 AudioCache 只被调度一次"。
     // 一旦同一个 cache 被再次调度（例如后续音频重建/恢复路径复用 cache），
-    // 第 202/215 行就会用 _pcmData + _framesRead * bytesPerFrame 作为写入偏移而越界，
+    // 下面就会用 _pcmData + _framesRead * bytesPerFrame 作为写入偏移而越界，
     // 造成堆破坏。这里显式归零，使本函数可重复进入且写入始终落在本次分配的缓冲内。
     _framesRead = 0;
+
+    // 同上：OpenAL 缓冲与流式队列缓冲也是"只写不还"的成员，再进入时会**直接覆盖**旧值 ——
+    // alGenBuffers 覆盖 _alBufferId、流式分支的 malloc 覆盖 _queBuffers[index]，
+    // 旧的那一份就此泄漏（一个 AL buffer 里装的可能是整首 PCM，队列缓冲是 4 份）。
+    // 所以在重新分配之前先把上一轮的归还掉。
+    //
+    // 今天这条路径其实还进不来（AudioEngineImpl::preload 只在 cache 首次出现时投递任务，
+    // 而它的调用方都在主线程），所以本调用在正常路径上是**空操作**；它的价值是把
+    // "不可重入"变成"可重入"，与上面 _framesRead 归零同一个理由 —— 一旦将来有别的
+    // 路径复用 cache，不会再变成资源泄漏。
+    releaseDecodedResources();
 
     AudioDecoder decoder;
     do {
