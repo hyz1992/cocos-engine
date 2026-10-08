@@ -268,6 +268,7 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
         // 线上"BGM 只播个开头就停"（约 QUEUEBUFFER_NUM × QUEUEBUFFER_TIME_STEP ≈ 2 秒后无声）
         // 就是这两个条件之一不成立导致的：这里把实际取值打出来，一次复现即可定位。
         auto lastRotateDiag = std::chrono::steady_clock::now();
+        auto lastResumeAttempt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
         ALint diagQueued = 0;
 
         while (!_isDestroyed) {
@@ -279,7 +280,11 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
              * is playing as it's too short. Interesting IOS system.
              * Solution is to load buffer even if it's paused, just make sure that there's no bufferProcessed in 
              */
-            if (sourceState == AL_PLAYING || sourceState == AL_PAUSED) {
+            // 注意 AL_STOPPED 也要进这个分支：广告/音频会话被接管后 iOS 可能把源直接停掉
+            // （一次采样都没渲染就 STOPPED），而补数据只在 PLAYING/PAUSED 时工作 ——
+            // 源一旦 STOPPED 就永远不再补数据，表现为"BGM 只播个开头就再也没声，
+            // 直到退出场景重进（那时是全新的音频源）"。循环播放的源在这里做自愈。
+            if (sourceState == AL_PLAYING || sourceState == AL_PAUSED || (sourceState == AL_STOPPED && _loop)) {
                 alGetSourcei(_alSource, AL_BUFFERS_PROCESSED, &bufferProcessed);
                 rotateDidWork = bufferProcessed > 0;
                 while (bufferProcessed > 0) {
@@ -320,6 +325,22 @@ void AudioPlayer::rotateBufferThread(int offsetFrame) {
                     alSourceUnqueueBuffers(_alSource, 1, &bid);
                     alBufferData(bid, _audioCache->_format, tmpBuffer, framesRead * decoder.getBytesPerFrame(), decoder.getSampleRate());
                     alSourceQueueBuffers(_alSource, 1, &bid);
+                }
+
+                // 自愈：补完数据后如果循环源仍处于 STOPPED（上面那种"压根没渲染就被停"的情况），
+                // 重新 alSourcePlay 让它接着放。限频 1 秒，避免在设备确实不可用时反复重播刷日志。
+                if (_loop) {
+                    ALint stateNow = 0;
+                    alGetSourcei(_alSource, AL_SOURCE_STATE, &stateNow);
+                    if (stateNow == AL_STOPPED) {
+                        auto nowResume = std::chrono::steady_clock::now();
+                        if (std::chrono::duration_cast<std::chrono::milliseconds>(nowResume - lastResumeAttempt).count() >= 1000) {
+                            lastResumeAttempt = nowResume;
+                            ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] Rotate: loop source was STOPPED unexpectedly -> re-queue + play again (queued=%d)",
+                                  diagQueued);
+                            alSourcePlay(_alSource);
+                        }
+                    }
                 }
             }
 

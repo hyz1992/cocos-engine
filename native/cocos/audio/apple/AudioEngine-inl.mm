@@ -190,6 +190,36 @@ static bool bkRebindOpenALContext(const char *reason) {
 }
 
 /**
+ "硬重启"音频 I/O：把 AVAudioSession 先停掉再打开，然后重绑 OpenAL 上下文。
+
+ 为什么需要（线上实测）：广告 SDK 抢走 AVAudioSession 后 iOS 会停掉底层 AudioUnit。
+ 只重绑 OpenAL 上下文能救回多数情况，但仍会出现"AU 一个采样都不渲染"的状态
+ （源 0.4 秒后还是 offset 0 且已 STOPPED）—— 此时必须让 iOS 真正重新建立音频 I/O 才能恢复。
+ 用户手动"切后台再回前台"之所以总能恢复，正是因为 iOS 在那一步做了同样的 stop + start I/O。
+
+ 注意：setActive:NO 会打断其它 App / 广告正在播放的声音，所以
+   ①只在"确知没有在渲染"（STALLED 检测）时调用；
+   ②广告展示期间不调用（此时会话本来就该归 SDK）。
+ */
+static bool bkHardRestartAudioIO(const char *reason) {
+    if (s_AudioEngineSessionHandler != nil && s_AudioEngineSessionHandler.adShowing) {
+        ALOGW("[AUDIO_DEBUG][BKAUDIOTRACE] HardRestart(%s): skipped, ad is showing", reason);
+        return false;
+    }
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSError *error = nil;
+    BOOL deactivated = [session setActive:NO error:&error];
+    ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] HardRestart(%s): setActive NO success=%d, error=%s",
+          reason, (int)deactivated, error ? error.description.UTF8String : "nil");
+    error = nil;
+    BOOL activated = [session setActive:YES error:&error];
+    ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] HardRestart(%s): setActive YES success=%d, error=%s",
+          reason, (int)activated, error ? error.description.UTF8String : "nil");
+    bool rebound = bkRebindOpenALContext(reason);
+    return activated && rebound;
+}
+
+/**
  把 AVAudioSession 拉回游戏期望的状态，并把 OpenAL 上下文重新挂上。
  广告SDK/录音等模块切走 session 后往往不会还原，这里统一做修复。
  只依赖文件级静态变量，所以音频引擎重建之后也能直接调用。
@@ -922,7 +952,9 @@ void AudioEngineImpl::play2dImpl(AudioCache *cache, int audioID) {
                         NSTimeInterval nowTs = [[NSDate date] timeIntervalSince1970];
                         if (nowTs - s_lastStalledRecover >= 5.0) {
                             s_lastStalledRecover = nowTs;
-                            bkRebindOpenALContext("stalled");
+                            // 先试轻量的重绑；既然已经检测到"没在渲染"，直接上硬重启
+                            // （setActive NO→YES + 重绑），等价于用户手动切后台再回前台的效果。
+                            bkHardRestartAudioIO("stalled");
                             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                                 ALint state3 = 0;
                                 ALint offset3 = 0;
@@ -939,6 +971,22 @@ void AudioEngineImpl::play2dImpl(AudioCache *cache, int audioID) {
                         // 正常推进用 D 级：避免每次播放都刷屏；只有异常（STALLED）才用 E 级。
                         ALOGD("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: progress ok audioID=%d source=%u state=%d offset %d -> %d",
                               audioID, source, state2, offset, offset2);
+                        // 另一种更隐蔽的"僵尸设备"：流式（BGM 这类长音频）源在 0.4 秒内
+                        // **一个采样都没渲染**就直接变成 STOPPED（偏移仍是 0）。
+                        // 这种情况下流式补数据线程也不会再工作（它只在 PLAYING/PAUSED 时补），
+                        // 表现为"BGM 只播个开头就再也没声，直到退出场景重进"。
+                        // 判据加 duration > 1s，避免把"本来就播完了的短流式音频"误判成异常。
+                        const bool longStreaming = (cache != nullptr) && cache->isStreaming() && cache->_duration > 1.0f;
+                        if (state2 == AL_STOPPED && offset2 == offset && longStreaming) {
+                            ALOGE("[AUDIO_DEBUG][BKAUDIOTRACE] play2dImpl: stream source stopped without rendering any sample! audioID=%d offset=%d duration=%.2f (audio unit not running?)",
+                                  audioID, offset2, cache->_duration);
+                            static NSTimeInterval s_lastNoRenderRecover = 0;
+                            NSTimeInterval nowNoRender = [[NSDate date] timeIntervalSince1970];
+                            if (nowNoRender - s_lastNoRenderRecover >= 5.0) {
+                                s_lastNoRenderRecover = nowNoRender;
+                                bkHardRestartAudioIO("noRender");
+                            }
+                        }
                     }
                 });
             } else {
