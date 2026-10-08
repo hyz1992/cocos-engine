@@ -367,8 +367,22 @@ static BKAudioRestoreResult bkRestoreAudioSession(const char *reason) {
     if (result == BKAudioRestoreResult::ContextUnavailable) {
         [self rebuildAudioEngine:@"contextRestoreFailed"];
     } else if (result == BKAudioRestoreResult::Ready && wasPending) {
-        // 清除 pending 后再进入 JS，避免续播请求重入同一次恢复。
-        bkNotifyAudioJS("onAudioSessionReady");
+        // 清除 pending 后再进入 JS，避免续播请求重入同一次恢复（needReactiveContext 上面已置好）。
+        // 【为什么不能立刻通知】本次恢复若是 scheduleRestoreAudioSession 那一串，后面还有
+        // 0.2 / 0.8 / 2.0 秒三次"会话恢复 + 上下文重绑"，**每一次重绑都会把所有 OpenAL 源停掉**。
+        // 2026-10-08 真机日志实锤：JS 收到"就绪"后立刻续播 BGM（resume SUCCESS - audio id=4），
+        // 紧接着 3 次 AudioRestore(delayed)+Rebind(delayed) 又把源停掉；而"就绪"只会通知这一次
+        // → JS 侧再也不会重试 → 表现为"广告回来 BGM 一直没声，切后台回来才好"。
+        // 所以延到补偿序列跑完之后（2.4 秒 > 最后一次 2.0 秒）再通知，并用 generation + 可恢复性
+        // 双重保护：期间又被广告/后台/录音抢走就不通知（等下一轮自己会再走到这里）。
+        NSUInteger notifyGeneration = self.restoreGeneration;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (self != s_AudioEngineSessionHandler || notifyGeneration != self.restoreGeneration) return;
+            if (self.needReactiveContext || ![self canRestoreAudioSession]) return;
+            ALOGI("[AUDIO_DEBUG][BKAUDIOTRACE] notify onAudioSessionReady after restore sequence settled (gen=%lu)",
+                  (unsigned long)notifyGeneration);
+            bkNotifyAudioJS("onAudioSessionReady");
+        });
     }
 }
 
