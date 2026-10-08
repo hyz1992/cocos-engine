@@ -115,6 +115,11 @@ scene::RenderWindow *Root::createRenderWindowFromSystemWindow(ISystemWindow *win
     info.width = static_cast<uint32_t>(size.width);
     info.height = static_cast<uint32_t>(size.height);
     info.windowHandle = reinterpret_cast<void *>(handle); // NOLINT
+    // Ask the platform for a surface object the render thread may read directly.
+    // iOS returns the CAMetalLayer here: the swapchain is initialized on the render
+    // thread, which must not call -[UIView layer] (Main Thread Checker violation).
+    // 0 means "not provided" and the swapchain falls back to windowHandle as before.
+    info.windowLayer = reinterpret_cast<void *>(window->getWindowLayer()); // NOLINT
     info.windowId = window->getWindowId();
 
     gfx::Swapchain *swapchain = gfx::Device::getInstance()->createSwapchain(info);

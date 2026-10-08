@@ -37,6 +37,7 @@ public:
 
     void closeWindow() override;
     uintptr_t getWindowHandle() const override;
+    uintptr_t getWindowLayer() const override;
 
     Size getViewSize() const override;
     /*
@@ -54,5 +55,8 @@ private:
     uint32_t _windowId{0};
     void* _externalHandle{nullptr};
     UIWindow* _window{nullptr};
+    // Cached CAMetalLayer of the game view, resolved on the main thread. Read by the
+    // render thread through getWindowLayer(): UIKit must never be touched from there.
+    mutable uintptr_t _windowLayer{0};
 };
 } // namespace cc

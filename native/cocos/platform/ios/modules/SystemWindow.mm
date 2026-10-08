@@ -51,6 +51,25 @@ uintptr_t SystemWindow::getWindowHandle() const {
     return reinterpret_cast<uintptr_t>(UIApplication.sharedApplication.delegate.window.rootViewController.view);
 }
 
+uintptr_t SystemWindow::getWindowLayer() const {
+    // UIKit is main-thread-only: reading -[UIView layer] from the render thread trips the
+    // Main Thread Checker ("UI API called on a background thread: -[UIView layer]") and
+    // Apple has announced that it will assert on such violations in a future OS release.
+    // So resolve the CAMetalLayer here, on the main thread, and hand it to the render
+    // thread through gfx::SwapchainInfo::windowLayer.
+    //
+    // When this is called from another thread we must not touch UIKit; return the last
+    // value resolved on the main thread (0 until then, which makes the caller fall back
+    // to the legacy windowHandle path instead of setting a nil layer).
+    if ([NSThread isMainThread]) {
+        UIView *view = UIApplication.sharedApplication.delegate.window.rootViewController.view;
+        if (view) {
+            _windowLayer = reinterpret_cast<uintptr_t>(view.layer);
+        }
+    }
+    return _windowLayer;
+}
+
 SystemWindow::Size SystemWindow::getViewSize() const {
     auto dpr = BasePlatform::getPlatform()->getInterface<IScreen>()->getDevicePixelRatio();
     CGRect bounds = [[UIScreen mainScreen] bounds];

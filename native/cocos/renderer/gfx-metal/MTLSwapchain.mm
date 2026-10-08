@@ -31,6 +31,7 @@
     #import <UIKit/UIView.h>
 #endif
 
+#import "base/Log.h"
 #import "MTLGPUObjects.h"
 #import "MTLDevice.h"
 #import "MTLGPUObjects.h"
@@ -62,8 +63,26 @@ void CCMTLSwapchain::doInit(const SwapchainInfo& info) {
         layer.device = MTLCreateSystemDefaultDevice();
     }
 #else
-    auto *view = (CCView *)info.windowHandle;
-    CAMetalLayer *layer = static_cast<CAMetalLayer *>(view.layer);
+    // This runs on the render/message-queue consumer thread, so UIKit must not be
+    // touched here. Prefer the layer the platform resolved on the main thread
+    // (see SwapchainInfo::windowLayer / SystemWindow::getWindowLayer()).
+    CAMetalLayer *layer = nullptr;
+    #if CC_PLATFORM == CC_PLATFORM_IOS
+    if (info.windowLayer) {
+        layer = static_cast<CAMetalLayer *>(info.windowLayer);
+    }
+    #endif
+    if (!layer) {
+        // Legacy path: -[UIView layer] off the main thread is exactly the violation we
+        // are removing. Kept only as a last resort, so that a missing windowLayer
+        // degrades to the previous behavior (which works) instead of leaving a nil
+        // CAMetalLayer behind (acquire() would then spin forever on nextDrawable).
+        auto *view = (CCView *)info.windowHandle;
+        layer = static_cast<CAMetalLayer *>(view.layer);
+    #if CC_PLATFORM == CC_PLATFORM_IOS
+        CC_LOG_WARNING("MTLSwapchain::doInit: windowLayer is empty, falling back to -[UIView layer] on the render thread.");
+    #endif
+    }
 #endif
 
     if (layer.pixelFormat == MTLPixelFormatInvalid) {

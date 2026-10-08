@@ -96,6 +96,20 @@ public:
 
     virtual void closeWindow() {}
     virtual uintptr_t getWindowHandle() const = 0;
+    /**
+     * @brief Returns a surface object that is safe to read from the render thread.
+     *
+     * Some platforms cannot hand their GPU surface to the render thread through
+     * getWindowHandle(): on iOS the handle is a UIView and the render thread would have
+     * to call -[UIView layer], a UIKit API restricted to the main thread. Those platforms
+     * override this to return an equivalent object resolved on the main thread
+     * (iOS: the CAMetalLayer of the game view).
+     *
+     * The default implementation returns 0, meaning "no such object, use
+     * getWindowHandle()". Implementations must never call main-thread-only APIs unless
+     * they can prove they are running on the main thread.
+     */
+    virtual uintptr_t getWindowLayer() const { return 0; }
     virtual Size getViewSize() const = 0;
     virtual void setViewSize(uint32_t width, uint32_t height) {}
     /**

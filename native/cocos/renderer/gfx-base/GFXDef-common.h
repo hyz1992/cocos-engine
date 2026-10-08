@@ -1030,6 +1030,14 @@ struct BindingMappingInfo {
 struct SwapchainInfo {
     uint32_t windowId{0};
     void *windowHandle{nullptr}; // @ts-overrides { type: 'HTMLCanvasElement' }
+    /**
+     * A surface object that is safe to read from the render thread, resolved on the main
+     * thread by the platform. On iOS this is the CAMetalLayer of the game view:
+     * windowHandle is a UIView there, and -[UIView layer] must not be called from the
+     * render thread (Main Thread Checker violation, Apple will assert in a future OS).
+     * nullptr means "not provided, fall back to windowHandle".
+     */
+    void *windowLayer{nullptr};
     VsyncMode vsyncMode{VsyncMode::ON};
 
     uint32_t width{0};
