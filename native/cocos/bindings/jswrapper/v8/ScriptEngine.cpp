@@ -39,6 +39,14 @@
 
     #include <sstream>
 
+    #if CC_PLATFORM == CC_PLATFORM_IOS
+        // A6 取证：OOM/fatal 日志里附原生内存数字（mach task_info + os_proc_available_memory）
+        #include <cstdio>
+        #include <mach/mach.h>
+        #include <mach/task_info.h>
+        #include <os/proc.h>
+    #endif
+
     #if SE_ENABLE_INSPECTOR
         #include "debugger/env.h"
         #include "debugger/inspector_agent.h"
@@ -305,6 +313,48 @@ static size_t utf16ColumnToByteOffset(const ccstd::string &utf8, int column) {
 ScriptEngine *ScriptEngine::instance = nullptr;
 ScriptEngine::DebuggerInfo ScriptEngine::debuggerInfo;
 
+#if CC_PLATFORM == CC_PLATFORM_IOS
+namespace {
+/**
+ A6 取证：OOM / fatal 时把**原生**内存数字一并打进日志。
+
+ 为什么需要：线上 C15 的 V8 fatal 只有"崩了"这一条信息，而崩溃报告里**没有**内存数据
+ （已核对本地样本：没有 VM Region Info / Memory Info 段），"是 V8 堆到顶还是设备整体内存
+ 不够"恰恰决定该往哪查。把三个数打出来即可判读：
+   is_heap_oom（引擎已打）= true  → V8 自己的堆上限到了（多半是我们的 JS 持有）
+   footprintMB                  → 进程物理占用（jetsam 看的就是它）
+   availableMB                  → 系统还能给这个进程多少（接近 0 = 设备内存压力）
+ 只填调用方给的栈缓冲，**自己不做任何堆分配**（致命路径上 malloc 可能失败），
+ 也不进 V8 —— 这一步必须是"最后仍能安全执行的代码"。
+ */
+void bkFillNativeMemory(char *buf, size_t len) {
+    if (buf == nullptr || len == 0) {
+        return;
+    }
+    unsigned long long residentMB = 0;
+    unsigned long long footprintMB = 0;
+    unsigned long long availableMB = 0;
+
+    mach_task_basic_info_data_t basic{};
+    mach_msg_type_number_t basicCount = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&basic), &basicCount) == KERN_SUCCESS) {
+        residentMB = basic.resident_size / (1024ULL * 1024ULL);
+    }
+
+    task_vm_info_data_t vmInfo{};
+    mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vmInfo), &vmCount) == KERN_SUCCESS) {
+        footprintMB = vmInfo.phys_footprint / (1024ULL * 1024ULL);
+    }
+
+    availableMB = static_cast<unsigned long long>(os_proc_available_memory()) / (1024ULL * 1024ULL);
+
+    snprintf(buf, len, "resident=%lluMB footprint=%lluMB available=%lluMB",
+             residentMB, footprintMB, availableMB);
+}
+} // namespace
+#endif
+
 void ScriptEngine::callExceptionCallback(const char *location, const char *message, const char *stack) {
     if (_nativeExceptionCallback) {
         _nativeExceptionCallback(location, message, stack);
@@ -319,6 +369,13 @@ void ScriptEngine::onFatalErrorCallback(const char *location, const char *messag
     errorStr += location;
     errorStr += ", message: ";
     errorStr += message;
+#if CC_PLATFORM == CC_PLATFORM_IOS
+    // A6：附上原生内存数字（见 bkFillNativeMemory 的说明），便于判读是堆到顶还是设备内存压力
+    char memoryBuf[192] = {0};
+    bkFillNativeMemory(memoryBuf, sizeof(memoryBuf));
+    errorStr += ", ";
+    errorStr += memoryBuf;
+#endif
 
     SE_LOGE("%s\n", errorStr.c_str());
 
@@ -353,6 +410,19 @@ void ScriptEngine::onOOMErrorCallback(const char *location,
     }
 
     errorStr += ", " + message;
+#if CC_PLATFORM == CC_PLATFORM_IOS
+    // A6：附上原生内存数字（见 bkFillNativeMemory）。与 is heap out of memory 一起判读：
+    //   true  + footprint 很大 → 我们的 JS 持有把 V8 堆撑满了
+    //   false / available 接近 0 → 设备整体内存压力（V8 只是想再要一块原生内存而失败）
+    char memoryBuf[192] = {0};
+    bkFillNativeMemory(memoryBuf, sizeof(memoryBuf));
+    errorStr += ", ";
+    errorStr += memoryBuf;
+    message += ", ";
+    // 同时带进原生回调（CocosApplication::handleException）：将来若要接落盘/上报，
+    // 内存数字会随记录一起留下，不必再改这里
+    message += memoryBuf;
+#endif
     SE_LOGE("%s\n", errorStr.c_str());
 
     // 线上证据（1.6.8 三例，机型为 iPhone16/17 等大内存设备）：这里回调 JS 时 JS 堆已经耗尽，
